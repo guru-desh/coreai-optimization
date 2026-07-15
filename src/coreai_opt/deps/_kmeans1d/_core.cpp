@@ -26,7 +26,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -38,11 +37,11 @@ typedef unsigned long ulong;
 /*
  *  Internal implementation of the SMAWK algorithm.
  */
-template <typename T>
+template <typename T, typename F>
 void _smawk(
         const vector<ulong>& rows,
         const vector<ulong>& cols,
-        const function<T(ulong, ulong)>& lookup,
+        const F& lookup,
         vector<ulong>* result) {
     // Recursion base case
     if (rows.size() == 0) return;
@@ -69,7 +68,7 @@ void _smawk(
     for (ulong i = 1; i < rows.size(); i += 2) {
         odd_rows.push_back(rows[i]);
     }
-    _smawk(odd_rows, _cols, lookup, result);
+    _smawk<T>(odd_rows, _cols, lookup, result);
 
     unordered_map<ulong, ulong> col_idx_lookup;
     for (ulong idx = 0; idx < _cols.size(); ++idx) {
@@ -105,11 +104,11 @@ void _smawk(
  *  Interface for the SMAWK algorithm, for finding the minimum value in each row
  *  of an implicitly-defined totally monotone matrix.
  */
-template <typename T>
+template <typename T, typename F>
 vector<ulong> smawk(
         const ulong num_rows,
         const ulong num_cols,
-        const function<T(ulong, ulong)>& lookup) {
+        const F& lookup) {
     vector<ulong> result;
     result.resize(num_rows);
     vector<ulong> rows(num_rows);
