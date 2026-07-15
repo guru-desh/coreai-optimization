@@ -319,6 +319,21 @@ void cluster_impl(
     }
 }
 
+// One item's inputs/outputs for cluster_batch(). weights may be null for the
+// unweighted case. Layout must match core.py's _ClusterItem/_ClusterResult
+// ctypes.Structure definitions field-for-field.
+struct ClusterItem {
+    const double* array;
+    ulong n;
+    ulong k;
+    const double* weights;
+};
+
+struct ClusterResult {
+    ulong* clusters;
+    double* centroids;
+};
+
 extern "C" {
 // "__declspec(dllexport)" causes the function to be exported when compiling on Windows.
 // Otherwise, the function is not exported and the code raises
@@ -352,6 +367,31 @@ void cluster_with_weights(
     cluster_impl<WeightedCostCalculator, const double*>(
         array, n, k, clusters, centroids, weights
     );
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_batch(
+        const ClusterItem* items,
+        ulong num_items,
+        ClusterResult* results) {
+    // Loops in C++ instead of one Python/ctypes round trip per item -- each
+    // item's result is bit-identical to calling cluster()/cluster_with_weights()
+    // on it individually (same cluster_impl call, same arguments).
+    for (ulong idx = 0; idx < num_items; ++idx) {
+        const ClusterItem& item = items[idx];
+        ClusterResult& result = results[idx];
+        if (item.weights == nullptr) {
+            cluster_impl<CostCalculator>(
+                item.array, item.n, item.k, result.clusters, result.centroids
+            );
+        } else {
+            cluster_impl<WeightedCostCalculator, const double*>(
+                item.array, item.n, item.k, result.clusters, result.centroids, item.weights
+            );
+        }
+    }
 }
 } // extern "C"
 
