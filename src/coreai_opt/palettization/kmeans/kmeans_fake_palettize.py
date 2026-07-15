@@ -72,6 +72,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         sensitivities: torch.Tensor = None,
         enable_fast_kmeans_mode: bool = True,
         rounding_precision: int = 4,
+        vectorize: bool = False,
         op_to_optimize: Callable | None = None,
         **kwargs,
     ):
@@ -86,6 +87,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
 
         self.enable_fast_kmeans_mode = enable_fast_kmeans_mode
         self.rounding_precision = rounding_precision
+        self.vectorize = vectorize
         self._sensitivities = sensitivities
         self._centroids_stale = False
 
@@ -434,6 +436,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             f"Clustering weights with kmeans 1d: "
             f"Weight dtype={block_weight_flatten.dtype}"
             f"enable_fast_kmeans_mode={self.enable_fast_kmeans_mode}"
+            f"vectorize={self.vectorize}"
             f"Range=({np.min(block_weight_flatten)},{np.max(block_weight_flatten)})"
         )
         if (block_weight_flatten.dtype == np.float16) or (
@@ -447,7 +450,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 counts = np.bincount(indices, weights=block_sensitivity_flatten)
 
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(
-                values, num_clusters, weights=counts
+                values, num_clusters, weights=counts, vectorize=self.vectorize
             )
 
             # Expand clusters according to np.unique indices
@@ -458,7 +461,10 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             )
         else:
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(
-                block_weight_flatten, num_clusters, weights=block_sensitivity_flatten
+                block_weight_flatten,
+                num_clusters,
+                weights=block_sensitivity_flatten,
+                vectorize=self.vectorize,
             )
 
         # First create numpy array from list and then tensor from numpy array.

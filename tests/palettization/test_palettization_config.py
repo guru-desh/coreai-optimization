@@ -12,6 +12,7 @@ from coreai_opt.palettization.config import (
     ModuleKMeansPalettizerConfig,
     OpKMeansPalettizerConfig,
 )
+from coreai_opt.palettization.kmeans.kmeans_fake_palettize import _KMeansFakePalettize
 from coreai_opt.palettization.spec import (
     PalettizationSpec,
     PerGroupedChannelGranularity,
@@ -110,6 +111,42 @@ def test_module_kmeans_palettizer_config_defaults():
 
     # Should have default module_state_spec (empty)
     assert config.module_state_spec == {}
+
+    # vectorize defaults to False (opt-in, unbenchmarked-for-most-block-sizes
+    # algorithm swap; see ModuleKMeansPalettizerConfig's docstring).
+    assert config.vectorize is False
+
+
+def test_module_kmeans_palettizer_config_vectorize_reaches_kmeans_fake_palettize():
+    """vectorize must survive _get_compressor_specific_settings() and land on the
+    instantiated _KMeansFakePalettize, the same generic kwargs-passthrough path
+    enable_fast_kmeans_mode/rounding_precision already use."""
+    config = ModuleKMeansPalettizerConfig(vectorize=True)
+    settings = config._get_compressor_specific_settings()
+    assert settings["vectorize"] is True
+
+    palettizer = _KMeansFakePalettize(
+        n_bits=4,
+        lut_qspec=None,
+        granularity=PerGroupedChannelGranularity(axis=0, group_size=32),
+        cluster_dim=1,
+        enable_per_channel_scale=False,
+        **settings,
+    )
+    assert palettizer.vectorize is True
+
+
+def test_module_kmeans_palettizer_config_vectorize_with_cluster_dim_gt_1_does_not_raise():
+    """Unlike enable_fast_kmeans_mode (genuinely unimplemented for cluster_dim > 1,
+    and validated against), vectorize only ever affects the cluster_dim == 1 kmeans1d
+    path; cluster_dim > 1 never calls it, so vectorize=True there is simply inert,
+    not forbidden. Regression guard against an overzealous validator being added
+    later by analogy with enable_fast_kmeans_mode's constraint."""
+    ModuleKMeansPalettizerConfig(
+        op_state_spec={"weight": PalettizationSpec(n_bits=4, cluster_dim=2)},
+        enable_fast_kmeans_mode=False,
+        vectorize=True,
+    )
 
 
 def test_module_kmeans_palettizer_config_with_op_state_spec():

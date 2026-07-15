@@ -140,6 +140,16 @@ class ModuleKMeansPalettizerConfig(
             K-means clustering. Higher values preserve more precision but may reduce
             speed benefits. Only used when enable_fast_kmeans_mode is True. Default: 4.
 
+        vectorize (bool): When True, the scalar (``cluster_dim == 1``) K-means
+            clustering step uses a naive O(n * k^2) dynamic program instead of the
+            default SMAWK-accelerated O(n * k) one, where n is the number of values
+            being clustered. Both compute the identical global optimum; only the
+            search strategy for the DP's row-minima differs. Empirically this is
+            faster only for small n (roughly n <~ 200-300, shrinking as k grows) and
+            can be dramatically slower otherwise, with no automatic fallback or size
+            guard. Has no effect when ``cluster_dim > 1`` (that path never uses this
+            DP at all). Default: False.
+
     Example:
         >>> config = ModuleKMeansPalettizerConfig()  # Uses defaults
         >>> # Or with custom settings:
@@ -160,6 +170,7 @@ class ModuleKMeansPalettizerConfig(
 
     enable_fast_kmeans_mode: bool = True
     rounding_precision: PositiveInt = 4
+    vectorize: bool = False
 
     # Namespace exposing built-in preset constructors.
     presets: ClassVar[_ModuleKMeansPalettizerConfigPresets]

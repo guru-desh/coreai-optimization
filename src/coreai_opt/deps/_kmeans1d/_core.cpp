@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
@@ -319,6 +320,102 @@ void cluster_impl(
     }
 }
 
+/*
+ *  Naive (no-SMAWK) O(k n^2) variant of cluster_impl, for the `vectorize=True`
+ *  flag: same sort / cost calculators / backtrack, but the row-minima search
+ *  for each D[k_][i] is a plain nested loop over every candidate split
+ *  instead of exploiting the cost matrix's total monotonicity via SMAWK.
+ *  Worse asymptotic complexity, but a flat, branch-free reduction that
+ *  compiler auto-vectorization can win on for small n (see
+ *  changelog.d/ and the benchmark writeup for the measured crossover).
+ */
+template <typename CostCalculatorType, typename... CostArgsTypes>
+void cluster_impl_naive(
+        const double* array,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        double* centroids,
+        CostArgsTypes... args) {
+    // ***************************************************
+    // * Sort input array and save info for de-sorting
+    // ***************************************************
+
+    vector<ulong> sort_idxs(n);
+    iota(sort_idxs.begin(), sort_idxs.end(), 0);
+    sort(
+        sort_idxs.begin(),
+        sort_idxs.end(),
+        [&array](ulong a, ulong b) {return array[a] < array[b];});
+    vector<ulong> undo_sort_lookup(n);
+    vector<double> sorted_array(n);
+    for (ulong i = 0; i < n; ++i) {
+        sorted_array[i] = array[sort_idxs[i]];
+        undo_sort_lookup[sort_idxs[i]] = i;
+    }
+
+    CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
+    Matrix<double> D(k, n);
+    Matrix<ulong> T(k, n);
+
+    for (ulong i = 0; i < n; ++i) {
+        D.set(0, i, cost_calculator.calc(0, i));
+        T.set(0, i, 0);
+    }
+
+    for (ulong k_ = 1; k_ < k; ++k_) {
+        for (ulong i = 0; i < n; ++i) {
+            ulong best_j = 1;
+            double best_cost = numeric_limits<double>::infinity();
+            for (ulong j = 1; j <= i; ++j) {
+                ulong col = i < j - 1 ? i : j - 1;
+                double candidate = D.get(k_ - 1, col) + cost_calculator.calc(j, i);
+                if (candidate < best_cost) {
+                    best_cost = candidate;
+                    best_j = j;
+                }
+            }
+            D.set(k_, i, best_cost);
+            T.set(k_, i, best_j);
+        }
+    }
+
+    // ***************************************************
+    // * Extract cluster assignments by backtracking
+    // ***************************************************
+
+    vector<double> sorted_clusters(n);
+
+    ulong t = n;
+    ulong k_ = k - 1;
+    ulong n_ = n - 1;
+    do {
+        ulong t_ = t;
+        t = T.get(k_, n_);
+        double centroid = 0.0;
+        for (ulong i = t; i < t_; ++i) {
+            sorted_clusters[i] = k_;
+            centroid += (
+                (sorted_array[i] - centroid)
+                * cost_calculator.weight(i, i)
+                / cost_calculator.weight(t, i)
+            );
+        }
+        centroids[k_] = centroid;
+        k_ -= 1;
+        n_ = t - 1;
+    } while (t > 0);
+
+    // ***************************************************
+    // * Order cluster assignments to match de-sorted
+    // * ordering
+    // ***************************************************
+
+    for (ulong i = 0; i < n; ++i) {
+        clusters[i] = sorted_clusters[undo_sort_lookup[i]];
+    }
+}
+
 extern "C" {
 // "__declspec(dllexport)" causes the function to be exported when compiling on Windows.
 // Otherwise, the function is not exported and the code raises
@@ -350,6 +447,33 @@ void cluster_with_weights(
         ulong* clusters,
         double* centroids) {
     cluster_impl<WeightedCostCalculator, const double*>(
+        array, n, k, clusters, centroids, weights
+    );
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_vectorized(
+        double* array,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        double* centroids) {
+    cluster_impl_naive<CostCalculator>(array, n, k, clusters, centroids);
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_vectorized_with_weights(
+        double* array,
+        double* weights,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        double* centroids) {
+    cluster_impl_naive<WeightedCostCalculator, const double*>(
         array, n, k, clusters, centroids, weights
     );
 }

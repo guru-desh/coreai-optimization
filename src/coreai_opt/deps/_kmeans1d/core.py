@@ -53,11 +53,28 @@ def _dll():
     return _DLL
 
 
-def cluster(array: Sequence[float], k: int, *, weights: Sequence[float] | None = None) -> Clustered:
+def cluster(
+    array: Sequence[float],
+    k: int,
+    *,
+    weights: Sequence[float] | None = None,
+    vectorize: bool = False,
+) -> Clustered:
     """
     :param array: A sequence of floats
     :param k: Number of clusters (int)
     :param weights: Sequence of weights (if provided, must have same length as `array`)
+    :param vectorize: If True, use a naive O(len(array) * k^2) dynamic program instead
+        of the default SMAWK-accelerated O(len(array) * k) one. SMAWK and the naive
+        DP compute the identical optimum (same D/T table; SMAWK is only a faster way
+        to find the same row-minima), so results are equivalent either way. In
+        practice the naive DP's flat, branch-free reduction can be faster than
+        SMAWK's recursive stack search for small inputs (empirically, roughly
+        len(array) <~ 200-300, shrinking as k grows), but becomes dramatically
+        *slower* past that crossover (e.g. 24x slower was measured at
+        len(array)=4217, k=256) since its time complexity is strictly worse. There
+        is no automatic fallback or size guard: pass True only when len(array) is
+        known to be small for the calling context.
     :return: A tuple with (clusters, centroids)
     """
     assert k > 0, f"Invalid k: {k}"
@@ -75,10 +92,14 @@ def cluster(array: Sequence[float], k: int, *, weights: Sequence[float] | None =
     c_centroids = (ctypes.c_double * k)()
 
     if weights is None:
-        _dll().cluster(c_array, c_n, c_k, c_clusters, c_centroids)
+        cluster_fn = _dll().cluster_vectorized if vectorize else _dll().cluster
+        cluster_fn(c_array, c_n, c_k, c_clusters, c_centroids)
     else:
         c_weights = (ctypes.c_double * n)(*weights)
-        _dll().cluster_with_weights(c_array, c_weights, c_n, c_k, c_clusters, c_centroids)
+        cluster_with_weights_fn = (
+            _dll().cluster_vectorized_with_weights if vectorize else _dll().cluster_with_weights
+        )
+        cluster_with_weights_fn(c_array, c_weights, c_n, c_k, c_clusters, c_centroids)
 
     clusters = list(c_clusters)
     centroids = list(c_centroids)
