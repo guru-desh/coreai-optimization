@@ -7,6 +7,7 @@ import os
 import tempfile
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -491,6 +492,83 @@ class Test_KMeansFakePalettize:
         assert palettized_weight.device.type == "mps"
         assert palettized_weight.shape == weight.shape
         assert palettized_weight.dtype == weight.dtype
+
+
+class TestVectorizeTorchBackend:
+    """`vectorize=True` (torch-native naive DP, core_torch.cluster) must reach the
+    same optimum as `vectorize=False` (SMAWK) through the real `_calculate_centroids`
+    entry point — covers both the fast-kmeans-mode dedup path (fp16-range weights)
+    and the full-array path (fp32 weights outside fp16 range), unweighted and
+    weighted (sensitivity-based).
+    """
+
+    def _inertia(self, weight: torch.Tensor, lut: torch.Tensor, indices: torch.Tensor) -> float:
+        reconstructed = lut.flatten()[indices.flatten().long()]
+        return torch.sum((weight.flatten().float() - reconstructed.float()) ** 2).item()
+
+    @pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+    def test_matches_smawk_unweighted(self, weight_dtype):
+        torch.manual_seed(0)
+        weight = torch.randn(64, 64, dtype=weight_dtype)
+        spec = PalettizationSpec(n_bits=4, granularity=PerTensorGranularity(), cluster_dim=1)
+
+        smawk = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            vectorize=False,
+        )
+        vectorized = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            vectorize=True,
+        )
+
+        lut_a, idx_a = smawk._calculate_centroids(weight)
+        lut_b, idx_b = vectorized._calculate_centroids(weight)
+
+        inertia_a = self._inertia(weight, lut_a, idx_a)
+        inertia_b = self._inertia(weight, lut_b, idx_b)
+        assert inertia_b == pytest.approx(inertia_a, rel=1e-2, abs=1e-6)
+
+    def test_matches_smawk_with_sensitivities(self):
+        torch.manual_seed(1)
+        weight = torch.randn(64, 64, dtype=torch.float32)
+        sensitivities = torch.rand(64, 64, dtype=torch.float32) + 0.1
+        spec = PalettizationSpec(n_bits=4, granularity=PerTensorGranularity(), cluster_dim=1)
+
+        smawk = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            sensitivities=sensitivities,
+            vectorize=False,
+        )
+        vectorized = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            sensitivities=sensitivities,
+            vectorize=True,
+        )
+
+        centroids_a, _ = smawk._cluster_weights_1d(weight, sensitivities)
+        centroids_b, _ = vectorized._cluster_weights_1d(weight, sensitivities)
+        np.testing.assert_allclose(
+            torch.sort(centroids_a).values.numpy(),
+            torch.sort(centroids_b).values.numpy(),
+            rtol=1e-2,
+            atol=1e-6,
+        )
 
 
 class TestPerGroupedChannelAxisDefault:

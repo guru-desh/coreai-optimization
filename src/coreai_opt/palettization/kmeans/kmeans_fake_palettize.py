@@ -449,8 +449,23 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             if block_sensitivity_flatten is not None:
                 counts = np.bincount(indices, weights=block_sensitivity_flatten)
 
+            if self.vectorize:
+                # Naive O(n*k^2) DP via torch tensors instead of the SMAWK-accelerated
+                # C++ extension — deliberately moves the (already deduplicated, so
+                # small) unique-value array to CUDA (if available) for the DP step
+                # and moves the result back, accepting the transfer cost as the
+                # price of running the O(n^2) compute on GPU. See core_torch.py.
+                torch_results = _kmeans1d.cluster_torch(
+                    torch.from_numpy(values),
+                    num_clusters,
+                    weights=torch.from_numpy(counts),
+                )
+                centroids = torch_results.centroids.to("cpu", torch.float64)
+                clusters = torch_results.clusters.to("cpu")[torch.from_numpy(indices)]
+                return centroids, clusters
+
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(
-                values, num_clusters, weights=counts, vectorize=self.vectorize
+                values, num_clusters, weights=counts, vectorize=False
             )
 
             # Expand clusters according to np.unique indices
@@ -460,11 +475,25 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 centroids=kmeans_results.centroids,
             )
         else:
+            if self.vectorize:
+                torch_results = _kmeans1d.cluster_torch(
+                    torch.from_numpy(block_weight_flatten),
+                    num_clusters,
+                    weights=(
+                        torch.from_numpy(block_sensitivity_flatten)
+                        if block_sensitivity_flatten is not None
+                        else None
+                    ),
+                )
+                centroids = torch_results.centroids.to("cpu", torch.float64)
+                clusters = torch_results.clusters.to("cpu")
+                return centroids, clusters
+
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(
                 block_weight_flatten,
                 num_clusters,
                 weights=block_sensitivity_flatten,
-                vectorize=self.vectorize,
+                vectorize=False,
             )
 
         # First create numpy array from list and then tensor from numpy array.
