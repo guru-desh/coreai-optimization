@@ -53,7 +53,7 @@ class _ClusterResult(ctypes.Structure):
     ]
 
 
-_EXTRA_CFLAGS = ["-std=c++11", "-O2", "-DNDEBUG"] + (
+_EXTRA_CFLAGS = ["-std=c++11", "-O3", "-DNDEBUG"] + (
     ["-stdlib=libc++"] if sys.platform == "darwin" else []
 )
 _EXTRA_LDFLAGS = ["-stdlib=libc++"] if sys.platform == "darwin" else []
