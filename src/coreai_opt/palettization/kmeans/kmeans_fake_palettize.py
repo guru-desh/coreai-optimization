@@ -485,6 +485,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                         if block_sensitivity_flatten is not None
                         else None
                     ),
+                    dtype=torch.float64,
                 )
                 centroids = torch_results.centroids.to("cpu", torch.float64)
                 clusters = torch_results.clusters.to("cpu")
