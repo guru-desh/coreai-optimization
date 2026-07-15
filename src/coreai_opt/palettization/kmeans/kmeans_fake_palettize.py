@@ -211,14 +211,24 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         indices = []
         num_clusters = 2**self.n_bits
 
-        for block_weight, block_sensitivity in zip(
-            block_weights_to_cluster, block_sensitivities, strict=True
-        ):
-            if self.cluster_dim == 1:
-                centroids, clusters = self._cluster_weights_1d(block_weight, block_sensitivity)
-            else:
-                centroids, clusters = self._cluster_weights_2d(block_weight, block_sensitivity)
+        if self.cluster_dim == 1:
+            # Batches all blocks' _kmeans1d calls into one C round trip
+            # instead of one per block (a tensor with per_grouped_channel
+            # granularity can have hundreds of blocks).
+            cluster_outputs = self._cluster_weights_1d_batch(
+                block_weights_to_cluster, block_sensitivities
+            )
+        else:
+            cluster_outputs = [
+                self._cluster_weights_2d(block_weight, block_sensitivity)
+                for block_weight, block_sensitivity in zip(
+                    block_weights_to_cluster, block_sensitivities, strict=True
+                )
+            ]
 
+        for block_weight, (centroids, clusters) in zip(
+            block_weights_to_cluster, cluster_outputs, strict=True
+        ):
             centroids = self._pad_lut_to_num_clusters(centroids, num_clusters)
 
             lut.append(centroids.to(weight.dtype))
@@ -467,6 +477,70 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         clusters = torch.from_numpy(np.array(kmeans_results.clusters))
 
         return centroids, clusters
+
+    def _cluster_weights_1d_batch(
+        self,
+        block_weights: list[torch.Tensor],
+        block_sensitivities: list[torch.Tensor | None],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Batched version of ``_cluster_weights_1d``: clusters every block in a
+        single ``_kmeans1d.cluster_batch()`` call instead of one
+        ``_kmeans1d.cluster()`` call per block, to amortize the Python/ctypes
+        round trip across all of a tensor's blocks. Per-block preprocessing
+        and postprocessing exactly mirror ``_cluster_weights_1d``; only the
+        clustering call itself is batched.
+        """
+        num_clusters = 2**self.n_bits
+        items = []
+        # Per-block np.unique() de-dup indices, if the fast-kmeans-mode path
+        # was used for that block (None otherwise), needed to expand that
+        # block's cluster_batch() result back to per-weight assignments.
+        expand_indices: list[np.ndarray | None] = []
+
+        for block_weight, block_sensitivity in zip(block_weights, block_sensitivities, strict=True):
+            if block_weight.dtype == torch.bfloat16:
+                block_weight = block_weight.float()
+
+            block_weight_flatten = block_weight.flatten().numpy()
+            if block_sensitivity is not None:
+                block_sensitivity_flatten = block_sensitivity.flatten().numpy()
+            else:
+                block_sensitivity_flatten = None
+
+            if (block_weight_flatten.dtype == np.float16) or (
+                self.enable_fast_kmeans_mode
+                and (np.max(block_weight_flatten)) <= np.finfo(np.float16).max
+                and np.min(block_weight_flatten) >= np.finfo(np.float16).min
+            ):
+                values, block_indices, counts = self._reduce_weights_to_cluster(
+                    block_weight_flatten
+                )
+                block_num_clusters = min(len(values), num_clusters)
+                if block_sensitivity_flatten is not None:
+                    counts = np.bincount(block_indices, weights=block_sensitivity_flatten)
+                items.append((values, block_num_clusters, counts))
+                expand_indices.append(block_indices)
+            else:
+                items.append((block_weight_flatten, num_clusters, block_sensitivity_flatten))
+                expand_indices.append(None)
+
+        kmeans_results_batch = _kmeans1d.cluster_batch(items)
+
+        outputs = []
+        for kmeans_results, block_indices in zip(kmeans_results_batch, expand_indices, strict=True):
+            if block_indices is not None:
+                # Expand clusters according to np.unique indices. kmeans_results
+                # is a namedtuple, which is why we use this constructor.
+                kmeans_results = type(kmeans_results)(
+                    clusters=np.array(kmeans_results.clusters)[block_indices].tolist(),
+                    centroids=kmeans_results.centroids,
+                )
+            centroids = torch.from_numpy(np.array(kmeans_results.centroids))
+            clusters = torch.from_numpy(np.array(kmeans_results.clusters))
+            outputs.append((centroids, clusters))
+
+        return outputs
 
     def _cluster_weights_2d(
         self,

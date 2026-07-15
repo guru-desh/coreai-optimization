@@ -32,6 +32,27 @@ from torch.utils.cpp_extension import load
 
 Clustered = namedtuple("Clustered", "clusters centroids")
 
+
+class _ClusterItem(ctypes.Structure):
+    """One cluster_batch() input item. Field order/types must match _core.cpp's ClusterItem."""
+
+    _fields_ = [
+        ("array", ctypes.POINTER(ctypes.c_double)),
+        ("n", ctypes.c_ulong),
+        ("k", ctypes.c_ulong),
+        ("weights", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
+class _ClusterResult(ctypes.Structure):
+    """One cluster_batch() output item. Field order/types must match _core.cpp's ClusterResult."""
+
+    _fields_ = [
+        ("clusters", ctypes.POINTER(ctypes.c_ulong)),
+        ("centroids", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
 _EXTRA_CFLAGS = ["-std=c++11", "-O2", "-DNDEBUG"] + (
     ["-stdlib=libc++"] if sys.platform == "darwin" else []
 )
@@ -86,3 +107,62 @@ def cluster(array: Sequence[float], k: int, *, weights: Sequence[float] | None =
     output = Clustered(clusters=clusters, centroids=centroids)
 
     return output
+
+
+def cluster_batch(
+    items: Sequence[tuple[Sequence[float], int, Sequence[float] | None]],
+) -> list[Clustered]:
+    """
+    Cluster multiple (array, k, weights) items in a single C call instead of
+    one Python/ctypes round trip per item. Each item's result is
+    bit-identical to calling `cluster()` on it individually.
+
+    :param items: sequence of (array, k, weights) tuples, matching cluster()'s args
+    :return: list of Clustered results, in the same order as `items`
+    """
+    num_items = len(items)
+    c_items = (_ClusterItem * num_items)()
+    c_results = (_ClusterResult * num_items)()
+
+    # ctypes doesn't keep referenced buffers alive once assigned into a
+    # struct's pointer field, so hold direct references until the call returns.
+    c_arrays = []
+    c_weights_arrays = []
+    c_clusters_arrays = []
+    c_centroids_arrays = []
+
+    for idx, (array, k, weights) in enumerate(items):
+        assert k > 0, f"Invalid k: {k}"
+        n = len(array)
+        assert n > 0, f"Invalid len(array): {n}"
+        k = min(k, n)
+
+        if weights is not None:
+            assert len(weights) == n, f"len(weights)={len(weights)} != len(array)={n}"
+
+        c_array = (ctypes.c_double * n)(*array)
+        c_clusters = (ctypes.c_ulong * n)()
+        c_centroids = (ctypes.c_double * k)()
+        c_arrays.append(c_array)
+        c_clusters_arrays.append(c_clusters)
+        c_centroids_arrays.append(c_centroids)
+
+        c_items[idx].array = ctypes.cast(c_array, ctypes.POINTER(ctypes.c_double))
+        c_items[idx].n = n
+        c_items[idx].k = k
+        if weights is None:
+            c_items[idx].weights = ctypes.POINTER(ctypes.c_double)()
+        else:
+            c_weights = (ctypes.c_double * n)(*weights)
+            c_weights_arrays.append(c_weights)
+            c_items[idx].weights = ctypes.cast(c_weights, ctypes.POINTER(ctypes.c_double))
+
+        c_results[idx].clusters = ctypes.cast(c_clusters, ctypes.POINTER(ctypes.c_ulong))
+        c_results[idx].centroids = ctypes.cast(c_centroids, ctypes.POINTER(ctypes.c_double))
+
+    _dll().cluster_batch(c_items, ctypes.c_ulong(num_items), c_results)
+
+    return [
+        Clustered(clusters=list(c_clusters_arrays[idx]), centroids=list(c_centroids_arrays[idx]))
+        for idx in range(num_items)
+    ]

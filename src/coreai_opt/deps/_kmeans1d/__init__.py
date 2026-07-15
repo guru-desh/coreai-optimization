@@ -22,6 +22,6 @@
 #
 # Copyright © 2026 Apple Inc.
 
-from coreai_opt.deps._kmeans1d.core import Clustered, cluster
+from coreai_opt.deps._kmeans1d.core import Clustered, cluster, cluster_batch
 
-__all__ = ["Clustered", "cluster"]
+__all__ = ["Clustered", "cluster", "cluster_batch"]

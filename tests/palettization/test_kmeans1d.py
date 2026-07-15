@@ -226,3 +226,65 @@ class TestKmeans1D:
         assert clusters[1] == clusters[3]
         assert clusters[0] != clusters[1]
         np.testing.assert_allclose(centroids, [0.05, 9.05], rtol=_RTOL, atol=_ATOL)
+
+
+class TestClusterBatch:
+    """cluster_batch() must be bit-identical to calling cluster() per item.
+
+    There's no external oracle for the batched API specifically -- the bar is
+    exact agreement with the already-tested single-item cluster() path.
+    """
+
+    def test_matches_sequential_unweighted(self):
+        rng = np.random.default_rng(21)
+        sizes = [(8, 4), (50, 16), (2000, 64)]
+        items = [(rng.standard_normal(n).tolist(), k, None) for n, k in sizes]
+
+        batch_results = _kmeans1d.cluster_batch(items)
+        sequential_results = [_kmeans1d.cluster(array, k) for array, k, _ in items]
+
+        for batch, sequential in zip(batch_results, sequential_results, strict=True):
+            np.testing.assert_array_equal(batch.clusters, sequential.clusters)
+            np.testing.assert_array_equal(batch.centroids, sequential.centroids)
+
+    def test_matches_sequential_weighted(self):
+        rng = np.random.default_rng(22)
+        items = []
+        for n, k in [(5, 2), (500, 16), (2000, 64)]:
+            array = rng.standard_normal(n).tolist()
+            weights = rng.uniform(0.1, 5.0, size=n).tolist()
+            items.append((array, k, weights))
+
+        batch_results = _kmeans1d.cluster_batch(items)
+        sequential_results = [_kmeans1d.cluster(array, k, weights=w) for array, k, w in items]
+
+        for batch, sequential in zip(batch_results, sequential_results, strict=True):
+            np.testing.assert_array_equal(batch.clusters, sequential.clusters)
+            np.testing.assert_array_equal(batch.centroids, sequential.centroids)
+
+    def test_matches_sequential_mixed_weighted_and_unweighted(self):
+        # A batch mixing weighted and unweighted items in the same call must
+        # dispatch each item to the correct underlying cluster_impl arm.
+        rng = np.random.default_rng(23)
+        items = [
+            (rng.standard_normal(10).tolist(), 4, None),
+            (rng.standard_normal(20).tolist(), 8, rng.uniform(0.1, 2.0, size=20).tolist()),
+            (rng.standard_normal(15).tolist(), 4, None),
+        ]
+
+        batch_results = _kmeans1d.cluster_batch(items)
+        sequential_results = [_kmeans1d.cluster(array, k, weights=w) for array, k, w in items]
+
+        for batch, sequential in zip(batch_results, sequential_results, strict=True):
+            np.testing.assert_array_equal(batch.clusters, sequential.clusters)
+            np.testing.assert_array_equal(batch.centroids, sequential.centroids)
+
+    def test_single_item_batch(self):
+        result = _kmeans1d.cluster_batch([([4.0, 4.1, 4.2, -50, 200.2], 2, None)])
+        assert len(result) == 1
+        expected = _kmeans1d.cluster([4.0, 4.1, 4.2, -50, 200.2], 2)
+        np.testing.assert_array_equal(result[0].clusters, expected.clusters)
+        np.testing.assert_array_equal(result[0].centroids, expected.centroids)
+
+    def test_empty_batch(self):
+        assert _kmeans1d.cluster_batch([]) == []
