@@ -459,6 +459,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                     torch.from_numpy(values),
                     num_clusters,
                     weights=torch.from_numpy(counts),
+                    dtype=torch.float64,
                 )
                 centroids = torch_results.centroids.to("cpu", torch.float64)
                 clusters = torch_results.clusters.to("cpu")[torch.from_numpy(indices)]
