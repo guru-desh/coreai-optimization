@@ -71,24 +71,46 @@ class _FakePalettInfo:
         return f"{self.module_name}.{self.attr_name}" if self.module_name else self.attr_name
 
 
-def _calculate_centroids_for_module(
+@dataclass
+class _CentroidResult:
+    """The buffers _calculate_centroids_slim() mutates on a _KMeansFakePalettize.
+
+    Carrying just these back from a worker (instead of the whole mutated
+    module) skips re-pickling the module's nn.Module bookkeeping -- hook
+    dicts, parameter/buffer registries, config objects -- that's unchanged
+    by the call and already exists on the parent's copy.
+    """
+
+    lut: torch.Tensor
+    indices: torch.Tensor
+    per_channel_scale: torch.Tensor | None
+    quantized_lut: torch.Tensor | None
+    lut_quantization_scale: torch.Tensor | None
+    lut_quantization_zero_point: torch.Tensor | None
+    disabled: bool
+    disabled_reason: str | None
+
+
+def _calculate_centroids_slim(
     args: tuple[_KMeansFakePalettize, torch.Tensor, str],
-) -> _KMeansFakePalettize:
+) -> _CentroidResult:
     """Compute centroids for a single _KMeansFakePalettize module.
 
     Worker entry point for cross-layer parallel centroid calculation. Defined
     at module level so it is picklable by ``torch.multiprocessing`` workers
     using the ``spawn`` start method.
 
-    Invokes ``fp_module.forward(weight)`` to mirror the sequential path.
+    Invokes ``fp_module.forward(weight)`` to mirror the sequential path, but
+    returns only the buffers that call mutates, not the whole module --
+    see ``_CentroidResult``.
 
     Args:
         args (tuple[_KMeansFakePalettize, torch.Tensor, str]): Tuple of
             ``(fp_module, weight, layer_name)``.
 
     Returns:
-        _KMeansFakePalettize: The mutated module, ready to be swapped into
-            the parent's parametrization slot.
+        _CentroidResult: The mutated buffer values, applied back onto the
+            parent's original module (never itself sent over the wire).
     """
     fp_module, weight, layer_name = args
 
@@ -100,7 +122,16 @@ def _calculate_centroids_for_module(
     if fp_module._disabled:
         fp_module._disabled_reason = f"layer {layer_name!r}"
 
-    return fp_module
+    return _CentroidResult(
+        lut=fp_module.lut,
+        indices=fp_module.indices,
+        per_channel_scale=fp_module.per_channel_scale,
+        quantized_lut=fp_module.quantized_lut,
+        lut_quantization_scale=fp_module.lut_quantization_scale,
+        lut_quantization_zero_point=fp_module.lut_quantization_zero_point,
+        disabled=fp_module._disabled,
+        disabled_reason=getattr(fp_module, "_disabled_reason", None),
+    )
 
 
 class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
@@ -468,8 +499,8 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
     def _calculate_centroids_parallel(self, num_workers: int) -> None:
         """Compute centroids for all _KMeansFakePalettize modules in parallel."""
         # Track parametrization slot (module, attr_name, idx) so the worker's
-        # mutated module can be swapped back in. Whole-module swap means every
-        # buffer and plain attribute round-trips automatically.
+        # result can be applied onto the original module still living here in
+        # the parent process -- it's never itself sent to a worker or back.
         fp_info: list[_FakePalettInfo] = []
         for module_name, module in self._model.named_modules(remove_duplicate=True):
             if not P.is_parametrized(module):
@@ -507,22 +538,28 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
         with ctx.Pool(processes=effective_workers) as pool:
             results = list(
                 tqdm(
-                    pool.imap(_calculate_centroids_for_module, pool_args),
+                    pool.imap(_calculate_centroids_slim, pool_args),
                     total=len(fp_info),
                     desc=f"Palettizing layers (num_workers={num_workers})",
                 )
             )
 
-        for info, new_fp in zip(fp_info, results, strict=True):
-            if getattr(new_fp, "_disabled", False):
-                logger.warning(
-                    f"Disabling palettization for a module: "
-                    f"{getattr(new_fp, '_disabled_reason', '')}"
-                )
-            # ParametrizationList supports item assignment; this swaps the
-            # worker's mutated module into the live model without touching
-            # the surrounding parametrization registration.
-            info.module.parametrizations[info.attr_name][info.idx] = new_fp
+        for info, result in zip(fp_info, results, strict=True):
+            if result.disabled:
+                logger.warning(f"Disabling palettization for a module: {result.disabled_reason}")
+            # Apply the worker's result directly onto the module already in
+            # its parametrization slot -- no swap needed, since that module
+            # was never sent to a worker or back.
+            fp_module = info.fp_module
+            fp_module.lut = result.lut
+            fp_module.indices = result.indices
+            fp_module.per_channel_scale = result.per_channel_scale
+            fp_module.quantized_lut = result.quantized_lut
+            fp_module.lut_quantization_scale = result.lut_quantization_scale
+            fp_module.lut_quantization_zero_point = result.lut_quantization_zero_point
+            fp_module._disabled = result.disabled
+            fp_module._disabled_reason = result.disabled_reason
+            fp_module._centroids_stale = False
 
     @staticmethod
     @contextmanager
