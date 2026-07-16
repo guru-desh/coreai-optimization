@@ -226,3 +226,27 @@ class TestKmeans1D:
         assert clusters[1] == clusters[3]
         assert clusters[0] != clusters[1]
         np.testing.assert_allclose(centroids, [0.05, 9.05], rtol=_RTOL, atol=_ATOL)
+
+    def test_presorted_input_matches_unsorted_equivalent(self):
+        # Exercises the is_sorted() skip-the-sort fast path (input already
+        # ascending) and checks it produces the same result as shuffling the
+        # same values through the normal sort path.
+        rng = np.random.default_rng(31)
+        sorted_array = np.sort(rng.standard_normal(500))
+        shuffled_array = rng.permutation(sorted_array)
+
+        sorted_result = _kmeans1d.cluster(sorted_array, 16)
+        shuffled_result = _kmeans1d.cluster(shuffled_array, 16)
+
+        np.testing.assert_allclose(
+            np.sort(sorted_result.centroids),
+            np.sort(shuffled_result.centroids),
+            rtol=_RTOL,
+            atol=_ATOL,
+        )
+        np.testing.assert_allclose(
+            _inertia(sorted_array, None, sorted_result.clusters, sorted_result.centroids),
+            _inertia(shuffled_array, None, shuffled_result.clusters, shuffled_result.centroids),
+            rtol=_RTOL,
+            atol=_ATOL,
+        )

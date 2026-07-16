@@ -232,15 +232,25 @@ void cluster_impl(
     // ***************************************************
 
     vector<ulong> sort_idxs(n);
-    iota(sort_idxs.begin(), sort_idxs.end(), 0);
-    sort(
-        sort_idxs.begin(),
-        sort_idxs.end(),
-        [&array](ulong a, ulong b) {return array[a] < array[b];});
-    vector<ulong> undo_sort_lookup(n);
     vector<double> sorted_array(n);
+    if (is_sorted(array, array + n)) {
+        // Already ascending (the common case is not this -- real weight
+        // blocks aren't pre-sorted -- but the O(n) check is cheap and lets
+        // pre-sorted callers skip the O(n log n) sort entirely).
+        iota(sort_idxs.begin(), sort_idxs.end(), 0);
+        copy(array, array + n, sorted_array.begin());
+    } else {
+        iota(sort_idxs.begin(), sort_idxs.end(), 0);
+        sort(
+            sort_idxs.begin(),
+            sort_idxs.end(),
+            [&array](ulong a, ulong b) {return array[a] < array[b];});
+        for (ulong i = 0; i < n; ++i) {
+            sorted_array[i] = array[sort_idxs[i]];
+        }
+    }
+    vector<ulong> undo_sort_lookup(n);
     for (ulong i = 0; i < n; ++i) {
-        sorted_array[i] = array[sort_idxs[i]];
         undo_sort_lookup[sort_idxs[i]] = i;
     }
 
