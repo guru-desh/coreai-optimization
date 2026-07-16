@@ -450,19 +450,21 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 counts = np.bincount(indices, weights=block_sensitivity_flatten)
 
             if self.vectorize:
-                # Naive O(n*k^2) DP via torch tensors instead of the SMAWK-accelerated
-                # C++ extension — deliberately moves the (already deduplicated, so
-                # small) unique-value array to CUDA (if available) for the DP step
-                # and moves the result back, accepting the transfer cost as the
-                # price of running the O(n^2) compute on GPU. See core_torch.py.
-                torch_results = _kmeans1d.cluster_torch(
+                # Naive O(n*k^2) DP via a hand-written CUDA kernel instead of the
+                # SMAWK-accelerated C++ extension. Supersedes the torch-tensor-ops
+                # backend (core_torch.py), which measured consistently slower than
+                # both SMAWK and the C++ naive-DP backend on real ResNet50/LLM Bolt
+                # runs, most plausibly due to its per-cluster host-device sync in
+                # backtrack. This kernel runs the whole DP + backtrack as kernel
+                # launches with zero host syncs until the result is read. See
+                # core_cuda_kernel.py / _cuda_kernel.cu. Requires CUDA.
+                cuda_results = _kmeans1d.cluster_cuda_kernel(
                     torch.from_numpy(values),
                     num_clusters,
                     weights=torch.from_numpy(counts),
-                    dtype=torch.float64,
                 )
-                centroids = torch_results.centroids.to("cpu", torch.float64)
-                clusters = torch_results.clusters.to("cpu")[torch.from_numpy(indices)]
+                centroids = cuda_results.centroids.to("cpu")
+                clusters = cuda_results.clusters.to("cpu")[torch.from_numpy(indices)]
                 return centroids, clusters
 
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(
@@ -477,7 +479,7 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             )
         else:
             if self.vectorize:
-                torch_results = _kmeans1d.cluster_torch(
+                cuda_results = _kmeans1d.cluster_cuda_kernel(
                     torch.from_numpy(block_weight_flatten),
                     num_clusters,
                     weights=(
@@ -485,10 +487,9 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                         if block_sensitivity_flatten is not None
                         else None
                     ),
-                    dtype=torch.float64,
                 )
-                centroids = torch_results.centroids.to("cpu", torch.float64)
-                clusters = torch_results.clusters.to("cpu")
+                centroids = cuda_results.centroids.to("cpu")
+                clusters = cuda_results.clusters.to("cpu")
                 return centroids, clusters
 
             kmeans_results: _kmeans1d.Clustered = _kmeans1d.cluster(

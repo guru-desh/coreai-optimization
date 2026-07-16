@@ -494,12 +494,14 @@ class Test_KMeansFakePalettize:
         assert palettized_weight.dtype == weight.dtype
 
 
-class TestVectorizeTorchBackend:
-    """`vectorize=True` (torch-native naive DP, core_torch.cluster) must reach the
-    same optimum as `vectorize=False` (SMAWK) through the real `_calculate_centroids`
-    entry point — covers both the fast-kmeans-mode dedup path (fp16-range weights)
-    and the full-array path (fp32 weights outside fp16 range), unweighted and
-    weighted (sensitivity-based).
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestVectorizeCudaKernelBackend:
+    """`vectorize=True` (CUDA kernel naive DP, core_cuda_kernel.cluster) must reach
+    the same optimum as `vectorize=False` (SMAWK) through the real
+    `_calculate_centroids` entry point — covers both the fast-kmeans-mode dedup path
+    (fp16-range weights) and the full-array path (fp32 weights outside fp16 range),
+    unweighted and weighted (sensitivity-based). Requires CUDA; skipped on this dev
+    machine, validated on Bolt instead.
     """
 
     def _inertia(self, weight: torch.Tensor, lut: torch.Tensor, indices: torch.Tensor) -> float:
