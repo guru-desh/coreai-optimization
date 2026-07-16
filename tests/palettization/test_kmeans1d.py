@@ -288,3 +288,24 @@ class TestClusterBatch:
 
     def test_empty_batch(self):
         assert _kmeans1d.cluster_batch([]) == []
+
+    def test_matches_sequential_decreasing_then_increasing_sizes(self):
+        # cluster_batch() reuses one set of scratch buffers across the whole
+        # batch (sized to the largest item seen so far). Order sizes
+        # large-then-small-then-large-again, mixing weighted/unweighted, to
+        # confirm a buffer previously sized for a bigger n/k doesn't leak
+        # stale data into a smaller item that reuses the same buffer.
+        rng = np.random.default_rng(24)
+        sizes = [(2000, 64), (5, 2), (8, 4), (500, 16), (10, 3)]
+        items = []
+        for i, (n, k) in enumerate(sizes):
+            array = rng.standard_normal(n).tolist()
+            weights = rng.uniform(0.1, 5.0, size=n).tolist() if i % 2 == 0 else None
+            items.append((array, k, weights))
+
+        batch_results = _kmeans1d.cluster_batch(items)
+        sequential_results = [_kmeans1d.cluster(array, k, weights=w) for array, k, w in items]
+
+        for batch, sequential in zip(batch_results, sequential_results, strict=True):
+            np.testing.assert_array_equal(batch.clusters, sequential.clusters)
+            np.testing.assert_array_equal(batch.centroids, sequential.centroids)

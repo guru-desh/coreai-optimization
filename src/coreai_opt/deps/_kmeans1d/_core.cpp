@@ -210,6 +210,16 @@ class Matrix {
         data.resize(num_rows * num_cols);
     }
 
+    // resize() reuses the backing vector's existing capacity when the new
+    // shape fits within it (std::vector::resize only reallocates when
+    // growing past capacity), so a Matrix reused across cluster_batch()
+    // items only allocates once, at the batch's largest shape.
+    void resize(ulong new_num_rows, ulong new_num_cols) {
+        num_rows = new_num_rows;
+        num_cols = new_num_cols;
+        data.resize(num_rows * num_cols);
+    }
+
     inline T get(ulong i, ulong j) {
         return data[i * num_cols + j];
     }
@@ -219,8 +229,20 @@ class Matrix {
     }
 };
 
+// Scratch buffers for cluster_impl_with_scratch(), reused across all items
+// in one cluster_batch() call instead of freshly allocated per item.
+struct ClusterScratch {
+    vector<ulong> sort_idxs;
+    vector<ulong> undo_sort_lookup;
+    vector<double> sorted_array;
+    vector<double> sorted_clusters;
+    Matrix<double> D{0, 0};
+    Matrix<ulong> T{0, 0};
+};
+
 template <typename CostCalculatorType, typename... CostArgsTypes>
-void cluster_impl(
+void cluster_impl_with_scratch(
+        ClusterScratch& scratch,
         const double* array,
         ulong n,
         ulong k,
@@ -231,17 +253,23 @@ void cluster_impl(
     // * Sort input array and save info for de-sorting
     // ***************************************************
 
-    vector<ulong> sort_idxs(n);
-    iota(sort_idxs.begin(), sort_idxs.end(), 0);
+    // resize() reuses each vector's existing capacity when it's already >= n
+    // (the common case once the batch's largest item has been processed
+    // once), so only the batch's first/largest item per buffer pays an
+    // allocation. Every element in [0, n) gets overwritten below before any
+    // read, so a buffer previously sized for a larger item can't leak stale
+    // data into a smaller one.
+    scratch.sort_idxs.resize(n);
+    iota(scratch.sort_idxs.begin(), scratch.sort_idxs.end(), 0);
     sort(
-        sort_idxs.begin(),
-        sort_idxs.end(),
+        scratch.sort_idxs.begin(),
+        scratch.sort_idxs.end(),
         [&array](ulong a, ulong b) {return array[a] < array[b];});
-    vector<ulong> undo_sort_lookup(n);
-    vector<double> sorted_array(n);
+    scratch.undo_sort_lookup.resize(n);
+    scratch.sorted_array.resize(n);
     for (ulong i = 0; i < n; ++i) {
-        sorted_array[i] = array[sort_idxs[i]];
-        undo_sort_lookup[sort_idxs[i]] = i;
+        scratch.sorted_array[i] = array[scratch.sort_idxs[i]];
+        scratch.undo_sort_lookup[scratch.sort_idxs[i]] = i;
     }
 
     // ***************************************************
@@ -250,9 +278,11 @@ void cluster_impl(
 
     // Algorithm as presented in section 2.2 of (Gronlund et al., 2017).
 
-    CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
-    Matrix<double> D(k, n);
-    Matrix<ulong> T(k, n);
+    CostCalculatorType cost_calculator(scratch.sorted_array, n, scratch.sort_idxs, args...);
+    scratch.D.resize(k, n);
+    scratch.T.resize(k, n);
+    Matrix<double>& D = scratch.D;
+    Matrix<ulong>& T = scratch.T;
 
     for (ulong i = 0; i < n; ++i) {
         D.set(0, i, cost_calculator.calc(0, i));
@@ -283,7 +313,8 @@ void cluster_impl(
     //       to be fully retained, although it currently is).
     //       Details are in section 3 of (Grønlund et al., 2017).
 
-    vector<double> sorted_clusters(n);
+    scratch.sorted_clusters.resize(n);
+    vector<double>& sorted_clusters = scratch.sorted_clusters;
 
     ulong t = n;
     ulong k_ = k - 1;
@@ -299,7 +330,7 @@ void cluster_impl(
             sorted_clusters[i] = k_;
             // Mean computation: this is only for squared L2 cost calculators
             centroid += (
-                (sorted_array[i] - centroid)
+                (scratch.sorted_array[i] - centroid)
                 * cost_calculator.weight(i, i)
                 / cost_calculator.weight(t, i)
             );
@@ -315,8 +346,22 @@ void cluster_impl(
     // ***************************************************
 
     for (ulong i = 0; i < n; ++i) {
-        clusters[i] = sorted_clusters[undo_sort_lookup[i]];
+        clusters[i] = sorted_clusters[scratch.undo_sort_lookup[i]];
     }
+}
+
+template <typename CostCalculatorType, typename... CostArgsTypes>
+void cluster_impl(
+        const double* array,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        double* centroids,
+        CostArgsTypes... args) {
+    ClusterScratch scratch;
+    cluster_impl_with_scratch<CostCalculatorType>(
+        scratch, array, n, k, clusters, centroids, args...
+    );
 }
 
 // One item's inputs/outputs for cluster_batch(). weights may be null for the
@@ -378,17 +423,23 @@ void cluster_batch(
         ClusterResult* results) {
     // Loops in C++ instead of one Python/ctypes round trip per item -- each
     // item's result is bit-identical to calling cluster()/cluster_with_weights()
-    // on it individually (same cluster_impl call, same arguments).
+    // on it individually (same cluster_impl call, same arguments). One
+    // ClusterScratch is reused across every item instead of each item
+    // allocating its own sort/DP buffers: std::vector::resize() only
+    // reallocates when growing past current capacity, so after the first
+    // (or largest) item, later items with smaller n/k reuse that capacity.
+    ClusterScratch scratch;
     for (ulong idx = 0; idx < num_items; ++idx) {
         const ClusterItem& item = items[idx];
         ClusterResult& result = results[idx];
         if (item.weights == nullptr) {
-            cluster_impl<CostCalculator>(
-                item.array, item.n, item.k, result.clusters, result.centroids
+            cluster_impl_with_scratch<CostCalculator>(
+                scratch, item.array, item.n, item.k, result.clusters, result.centroids
             );
         } else {
-            cluster_impl<WeightedCostCalculator, const double*>(
-                item.array, item.n, item.k, result.clusters, result.centroids, item.weights
+            cluster_impl_with_scratch<WeightedCostCalculator, const double*>(
+                scratch, item.array, item.n, item.k, result.clusters, result.centroids,
+                item.weights
             );
         }
     }
