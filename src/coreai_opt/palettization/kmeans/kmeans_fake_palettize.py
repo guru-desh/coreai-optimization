@@ -4,6 +4,7 @@
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import logging
+import os
 from collections.abc import Callable
 
 import numpy as np
@@ -29,6 +30,11 @@ from .kmeans_support_mixins import _LinearPalettizationMixin
 from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
 logger = logging.getLogger(__name__)
+
+# Throwaway instrumentation for the batching investigation (see plan Phase 9/10):
+# opt-in, env-gated per-block shape logging, read once at import time to avoid
+# per-call os.environ overhead that could perturb timing runs. Not shipped.
+_DEBUG_SHAPES = os.environ.get("KMEANS1D_DEBUG_SHAPES") == "1"
 
 
 @_FakePalettizeImplBase.register("default")
@@ -213,11 +219,16 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         indices = []
         num_clusters = 2**self.n_bits
 
-        for block_weight, block_sensitivity in zip(
-            block_weights_to_cluster, block_sensitivities, strict=True
+        for block_idx, (block_weight, block_sensitivity) in enumerate(
+            zip(block_weights_to_cluster, block_sensitivities, strict=True)
         ):
             if self.cluster_dim == 1:
-                centroids, clusters = self._cluster_weights_1d(block_weight, block_sensitivity)
+                centroids, clusters = self._cluster_weights_1d(
+                    block_weight,
+                    block_sensitivity,
+                    block_idx=block_idx,
+                    num_blocks=len(block_weights_to_cluster),
+                )
             else:
                 centroids, clusters = self._cluster_weights_2d(block_weight, block_sensitivity)
 
@@ -415,6 +426,9 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         self,
         block_weight: torch.Tensor,
         block_sensitivity: torch.Tensor | None,
+        *,
+        block_idx: int | None = None,
+        num_blocks: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Cluster weights such that each centroid is a 1d scalar, i.e., cluster_dim == 1.
@@ -449,6 +463,13 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
             if block_sensitivity_flatten is not None:
                 counts = np.bincount(indices, weights=block_sensitivity_flatten)
 
+            if _DEBUG_SHAPES:
+                logger.warning(
+                    f"KMEANS1D_DEBUG_SHAPES module={id(self)} n={len(values)} "
+                    f"k={num_clusters} block_idx={block_idx} num_blocks={num_blocks} "
+                    f"vectorize={self.vectorize}"
+                )
+
             if self.vectorize:
                 # Naive O(n*k^2) DP via a hand-written CUDA kernel instead of the
                 # SMAWK-accelerated C++ extension. Supersedes the torch-tensor-ops
@@ -478,6 +499,13 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
                 centroids=kmeans_results.centroids,
             )
         else:
+            if _DEBUG_SHAPES:
+                logger.warning(
+                    f"KMEANS1D_DEBUG_SHAPES module={id(self)} n={len(block_weight_flatten)} "
+                    f"k={num_clusters} block_idx={block_idx} num_blocks={num_blocks} "
+                    f"vectorize={self.vectorize}"
+                )
+
             if self.vectorize:
                 cuda_results = _kmeans1d.cluster_cuda_kernel(
                     torch.from_numpy(block_weight_flatten),

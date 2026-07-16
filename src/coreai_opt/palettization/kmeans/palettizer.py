@@ -51,6 +51,12 @@ from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
 logger = logging.getLogger(__name__)
 
+# Throwaway instrumentation for the batching investigation (see plan Phase 9/10):
+# maps id(fp_module) (logged per-block in kmeans_fake_palettize.py) back to a real
+# layer_name, since _KMeansFakePalettize has no layer_name attribute of its own.
+# Not shipped.
+_DEBUG_SHAPES = os.environ.get("KMEANS1D_DEBUG_SHAPES") == "1"
+
 # Threshold to clip very small sensitivity values to stabilize k-means
 _SENSITIVITY_CLIP_THR: float = 1e-12
 
@@ -91,6 +97,9 @@ def _calculate_centroids_for_module(
             the parent's parametrization slot.
     """
     fp_module, weight, layer_name = args
+
+    if _DEBUG_SHAPES:
+        logger.warning(f"KMEANS1D_MODULE_MAP id={id(fp_module)} layer_name={layer_name!r}")
 
     try:
         fp_module(weight)
@@ -438,13 +447,18 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
     def _calculate_centroids_sequential(self, example_inputs: tuple[torch.Tensor]) -> None:
         """Run a forward pass to calculate centroids, with a per-layer progress bar."""
         fp_modules: list[_KMeansFakePalettize] = []
-        for _, module in self._model.named_modules(remove_duplicate=True):
+        for module_name, module in self._model.named_modules(remove_duplicate=True):
             if not P.is_parametrized(module):
                 continue
-            for parametrizations in module.parametrizations.values():
+            for attr_name, parametrizations in module.parametrizations.items():
                 for p in parametrizations:
                     if isinstance(p, _KMeansFakePalettize):
                         fp_modules.append(p)
+                        if _DEBUG_SHAPES:
+                            layer_name = f"{module_name}.{attr_name}" if module_name else attr_name
+                            logger.warning(
+                                f"KMEANS1D_MODULE_MAP id={id(p)} layer_name={layer_name!r}"
+                            )
                         break
 
         progress = tqdm(total=len(fp_modules), desc="Palettizing layers (num_workers=1)")
