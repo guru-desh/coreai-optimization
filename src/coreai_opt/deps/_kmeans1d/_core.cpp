@@ -164,7 +164,7 @@ class WeightedCostCalculator {
             const vector<double>& vec,
             ulong n,
             const vector<ulong>& sort_idxs,
-            const double* unsorted_weights) {
+            const double* __restrict__ unsorted_weights) {
         vector<double> sorted_weights(n);
         for (ulong i = 0; i < n; ++i) {
             sorted_weights[i] = unsorted_weights[sort_idxs[i]];
@@ -220,11 +220,11 @@ class Matrix {
 
 template <typename CostCalculatorType, typename... CostArgsTypes>
 void cluster_impl(
-        const double* array,
+        const double* __restrict__ array,
         ulong n,
         ulong k,
-        ulong* clusters,
-        double* centroids,
+        ulong* __restrict__ clusters,
+        double* __restrict__ centroids,
         CostArgsTypes... args) {
     // ***************************************************
     // * Sort input array and save info for de-sorting
@@ -330,11 +330,11 @@ extern "C" {
 __declspec(dllexport)
 #endif
 void cluster(
-        double* array,
+        double* __restrict__ array,
         ulong n,
         ulong k,
-        ulong* clusters,
-        double* centroids) {
+        ulong* __restrict__ clusters,
+        double* __restrict__ centroids) {
     cluster_impl<CostCalculator>(array, n, k, clusters, centroids);
 }
 
@@ -342,12 +342,12 @@ void cluster(
 __declspec(dllexport)
 #endif
 void cluster_with_weights(
-        double* array,
-        double* weights,
+        double* __restrict__ array,
+        double* __restrict__ weights,
         ulong n,
         ulong k,
-        ulong* clusters,
-        double* centroids) {
+        ulong* __restrict__ clusters,
+        double* __restrict__ centroids) {
     cluster_impl<WeightedCostCalculator, const double*>(
         array, n, k, clusters, centroids, weights
     );
