@@ -53,13 +53,22 @@ def _dll():
     return _DLL
 
 
-def cluster(array: Sequence[float], k: int, *, weights: Sequence[float] | None = None) -> Clustered:
+def cluster(
+    array: Sequence[float],
+    k: int,
+    *,
+    weights: Sequence[float] | None = None,
+    dtype: str = "float64",
+) -> Clustered:
     """
     :param array: A sequence of floats
     :param k: Number of clusters (int)
     :param weights: Sequence of weights (if provided, must have same length as `array`)
+    :param dtype: Either "float64" (default, matches the original vendored precision) or
+        "float32" (halves the C-side scalar width; output will not exactly match "float64").
     :return: A tuple with (clusters, centroids)
     """
+    assert dtype in ("float64", "float32"), f"Invalid dtype: {dtype}"
     assert k > 0, f"Invalid k: {k}"
     n = len(array)
     assert n > 0, f"Invalid len(array): {n}"
@@ -68,17 +77,20 @@ def cluster(array: Sequence[float], k: int, *, weights: Sequence[float] | None =
     if weights is not None:
         assert len(weights) == n, f"len(weights)={len(weights)} != len(array)={n}"
 
-    c_array = (ctypes.c_double * n)(*array)
+    c_scalar = ctypes.c_float if dtype == "float32" else ctypes.c_double
+    c_array = (c_scalar * n)(*array)
     c_n = ctypes.c_ulong(n)
     c_k = ctypes.c_ulong(k)
     c_clusters = (ctypes.c_ulong * n)()
-    c_centroids = (ctypes.c_double * k)()
+    c_centroids = (c_scalar * k)()
 
     if weights is None:
-        _dll().cluster(c_array, c_n, c_k, c_clusters, c_centroids)
+        fn = _dll().cluster_f32 if dtype == "float32" else _dll().cluster
+        fn(c_array, c_n, c_k, c_clusters, c_centroids)
     else:
-        c_weights = (ctypes.c_double * n)(*weights)
-        _dll().cluster_with_weights(c_array, c_weights, c_n, c_k, c_clusters, c_centroids)
+        c_weights = (c_scalar * n)(*weights)
+        fn = _dll().cluster_with_weights_f32 if dtype == "float32" else _dll().cluster_with_weights
+        fn(c_array, c_weights, c_n, c_k, c_clusters, c_centroids)
 
     clusters = list(c_clusters)
     centroids = list(c_centroids)

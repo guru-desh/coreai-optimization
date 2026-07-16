@@ -226,3 +226,59 @@ class TestKmeans1D:
         assert clusters[1] == clusters[3]
         assert clusters[0] != clusters[1]
         np.testing.assert_allclose(centroids, [0.05, 9.05], rtol=_RTOL, atol=_ATOL)
+
+
+class TestClusterFloat32:
+    """dtype="float32" trades precision for halved C-side scalar width.
+
+    Unlike every other code path, float32 isn't required to be bit-identical
+    (or even exactly equal) to the float64 result -- rounding differs by
+    construction, and can shift which side of a SMAWK argmin comparison
+    wins, producing a genuinely different optimal partition. The bar here is
+    reconstruction quality (inertia) staying close to the float64 result,
+    not exact cluster labels or centroids.
+    """
+
+    _F32_RTOL = 1e-3
+
+    def test_matches_float64_reconstruction_quality_unweighted(self):
+        rng = np.random.default_rng(41)
+        array = rng.standard_normal(2000).astype(np.float64)
+
+        result64 = _kmeans1d.cluster(array, 16)
+        result32 = _kmeans1d.cluster(array.astype(np.float32).tolist(), 16, dtype="float32")
+
+        inertia64 = _inertia(array, None, result64.clusters, result64.centroids)
+        inertia32 = _inertia(array, None, result32.clusters, result32.centroids)
+        np.testing.assert_allclose(inertia32, inertia64, rtol=self._F32_RTOL)
+
+    def test_matches_float64_reconstruction_quality_weighted(self):
+        rng = np.random.default_rng(42)
+        array = rng.standard_normal(500).astype(np.float64)
+        weights = rng.uniform(0.1, 5.0, size=500).astype(np.float64)
+
+        result64 = _kmeans1d.cluster(array, 16, weights=weights)
+        result32 = _kmeans1d.cluster(
+            array.astype(np.float32).tolist(),
+            16,
+            weights=weights.astype(np.float32).tolist(),
+            dtype="float32",
+        )
+
+        inertia64 = _inertia(array, weights, result64.clusters, result64.centroids)
+        inertia32 = _inertia(array, weights, result32.clusters, result32.centroids)
+        np.testing.assert_allclose(inertia32, inertia64, rtol=self._F32_RTOL)
+
+    def test_centroids_are_ascending_and_dtype_is_float32(self):
+        rng = np.random.default_rng(43)
+        array = rng.standard_normal(1000).astype(np.float32)
+        result = _kmeans1d.cluster(array.tolist(), 16, dtype="float32")
+
+        centroids = np.asarray(result.centroids, dtype=np.float32)
+        clusters = np.asarray(result.clusters)
+        assert np.all(np.diff(centroids) >= 0), "centroids must be ascending"
+        assert clusters.min() >= 0 and clusters.max() < len(centroids)
+
+    def test_rejects_invalid_dtype(self):
+        with pytest.raises(AssertionError):
+            _kmeans1d.cluster([1.0, 2.0, 3.0], 2, dtype="float16")

@@ -123,29 +123,30 @@ vector<ulong> smawk(
 /*
  *  Calculates cluster costs in O(1) using prefix sum arrays.
  */
+template <typename Scalar>
 class CostCalculator {
-    vector<double> cumsum;
-    vector<double> cumsum2;
+    vector<Scalar> cumsum;
+    vector<Scalar> cumsum2;
 
   public:
-    CostCalculator(const vector<double>& vec, ulong n, const vector<ulong>& /*sort_idxs*/) {
+    CostCalculator(const vector<Scalar>& vec, ulong n, const vector<ulong>& /*sort_idxs*/) {
         cumsum.push_back(0.0);
         cumsum2.push_back(0.0);
         for (ulong i = 0; i < n; ++i) {
-            double x = vec[i];
+            Scalar x = vec[i];
             cumsum.push_back(x + cumsum[i]);
             cumsum2.push_back(x * x + cumsum2[i]);
         }
     }
 
-    double weight(ulong i, ulong j) {
+    Scalar weight(ulong i, ulong j) {
         return (i <= j) ? 1 + j - i : 0;
     }
 
-    double calc(ulong i, ulong j) {
+    Scalar calc(ulong i, ulong j) {
         if (j < i) return 0.0;
-        double mu = (cumsum[j + 1] - cumsum[i]) / (j - i + 1);
-        double result = cumsum2[j + 1] - cumsum2[i];
+        Scalar mu = (cumsum[j + 1] - cumsum[i]) / (j - i + 1);
+        Scalar result = cumsum2[j + 1] - cumsum2[i];
         result += (j - i + 1) * (mu * mu);
         result -= (2 * mu) * (cumsum[j + 1] - cumsum[i]);
         return result;
@@ -155,18 +156,19 @@ class CostCalculator {
 /*
  *  Weighted version of the CostCalculator
  */
+template <typename Scalar>
 class WeightedCostCalculator {
-    vector<double> cumw;
-    vector<double> cumsum;
-    vector<double> cumsum2;
+    vector<Scalar> cumw;
+    vector<Scalar> cumsum;
+    vector<Scalar> cumsum2;
 
   public:
     WeightedCostCalculator(
-            const vector<double>& vec,
+            const vector<Scalar>& vec,
             ulong n,
             const vector<ulong>& sort_idxs,
-            const double* unsorted_weights) {
-        vector<double> sorted_weights(n);
+            const Scalar* unsorted_weights) {
+        vector<Scalar> sorted_weights(n);
         for (ulong i = 0; i < n; ++i) {
             sorted_weights[i] = unsorted_weights[sort_idxs[i]];
         }
@@ -174,23 +176,23 @@ class WeightedCostCalculator {
         cumsum.push_back(0.0);
         cumsum2.push_back(0.0);
         for (ulong i = 0; i < n; ++i) {
-            double x = vec[i];
-            double w = sorted_weights[i];
+            Scalar x = vec[i];
+            Scalar w = sorted_weights[i];
             cumw.push_back(w + cumw[i]);
             cumsum.push_back(w * x + cumsum[i]);
             cumsum2.push_back(w * x * x + cumsum2[i]);
         }
     }
 
-    double weight(ulong i, ulong j) {
+    Scalar weight(ulong i, ulong j) {
         return (i <= j) ? cumw[j + 1] - cumw[i] : 0.0;
     }
 
-    double calc(ulong i, ulong j) {
+    Scalar calc(ulong i, ulong j) {
         if (j < i) return 0.0;
-        double w = weight(i, j);
-        double mu = (cumsum[j + 1] - cumsum[i]) / w;
-        double result = cumsum2[j + 1] - cumsum2[i];
+        Scalar w = weight(i, j);
+        Scalar mu = (cumsum[j + 1] - cumsum[i]) / w;
+        Scalar result = cumsum2[j + 1] - cumsum2[i];
         result += w * (mu * mu);
         result -= (2 * mu) * (cumsum[j + 1] - cumsum[i]);
         return result;
@@ -219,13 +221,13 @@ class Matrix {
     }
 };
 
-template <typename CostCalculatorType, typename... CostArgsTypes>
+template <typename Scalar, template <typename> class CostCalculatorType, typename... CostArgsTypes>
 void cluster_impl(
-        const double* array,
+        const Scalar* array,
         ulong n,
         ulong k,
         ulong* clusters,
-        double* centroids,
+        Scalar* centroids,
         CostArgsTypes... args) {
     // ***************************************************
     // * Sort input array and save info for de-sorting
@@ -238,7 +240,7 @@ void cluster_impl(
         sort_idxs.end(),
         [&array](ulong a, ulong b) {return array[a] < array[b];});
     vector<ulong> undo_sort_lookup(n);
-    vector<double> sorted_array(n);
+    vector<Scalar> sorted_array(n);
     for (ulong i = 0; i < n; ++i) {
         sorted_array[i] = array[sort_idxs[i]];
         undo_sort_lookup[sort_idxs[i]] = i;
@@ -250,8 +252,8 @@ void cluster_impl(
 
     // Algorithm as presented in section 2.2 of (Gronlund et al., 2017).
 
-    CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
-    Matrix<double> D(k, n);
+    CostCalculatorType<Scalar> cost_calculator(sorted_array, n, sort_idxs, args...);
+    Matrix<Scalar> D(k, n);
     Matrix<ulong> T(k, n);
 
     for (ulong i = 0; i < n; ++i) {
@@ -260,14 +262,14 @@ void cluster_impl(
     }
 
     for (ulong k_ = 1; k_ < k; ++k_) {
-        auto C = [&D, &k_, &cost_calculator](ulong i, ulong j) -> double {
+        auto C = [&D, &k_, &cost_calculator](ulong i, ulong j) -> Scalar {
             ulong col = i < j - 1 ? i : j - 1;
             return D.get(k_ - 1, col) + cost_calculator.calc(j, i);
         };
-        vector<ulong> row_argmins = smawk<double>(n, n, C);
+        vector<ulong> row_argmins = smawk<Scalar>(n, n, C);
         for (ulong i = 0; i < row_argmins.size(); ++i) {
             ulong argmin = row_argmins[i];
-            double min = C(i, argmin);
+            Scalar min = C(i, argmin);
             D.set(k_, i, min);
             T.set(k_, i, argmin);
         }
@@ -283,7 +285,7 @@ void cluster_impl(
     //       to be fully retained, although it currently is).
     //       Details are in section 3 of (Grønlund et al., 2017).
 
-    vector<double> sorted_clusters(n);
+    vector<Scalar> sorted_clusters(n);
 
     ulong t = n;
     ulong k_ = k - 1;
@@ -294,7 +296,7 @@ void cluster_impl(
     do {
         ulong t_ = t;
         t = T.get(k_, n_);
-        double centroid = 0.0;
+        Scalar centroid = 0.0;
         for (ulong i = t; i < t_; ++i) {
             sorted_clusters[i] = k_;
             // Mean computation: this is only for squared L2 cost calculators
@@ -336,7 +338,7 @@ void cluster(
         ulong k,
         ulong* clusters,
         double* centroids) {
-    cluster_impl<CostCalculator>(array, n, k, clusters, centroids);
+    cluster_impl<double, CostCalculator>(array, n, k, clusters, centroids);
 }
 
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -349,7 +351,34 @@ void cluster_with_weights(
         ulong k,
         ulong* clusters,
         double* centroids) {
-    cluster_impl<WeightedCostCalculator, const double*>(
+    cluster_impl<double, WeightedCostCalculator, const double*>(
+        array, n, k, clusters, centroids, weights
+    );
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_f32(
+        float* array,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        float* centroids) {
+    cluster_impl<float, CostCalculator>(array, n, k, clusters, centroids);
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_with_weights_f32(
+        float* array,
+        float* weights,
+        ulong n,
+        ulong k,
+        ulong* clusters,
+        float* centroids) {
+    cluster_impl<float, WeightedCostCalculator, const float*>(
         array, n, k, clusters, centroids, weights
     );
 }
