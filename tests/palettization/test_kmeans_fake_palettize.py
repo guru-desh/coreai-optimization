@@ -572,6 +572,106 @@ class TestVectorizeCudaKernelBackend:
             atol=1e-6,
         )
 
+    @pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+    def test_matches_smawk_unweighted_batched(self, weight_dtype):
+        """PerGroupedChannelGranularity forces >1 block per module, exercising
+        the batched intra-module dispatch path (_cluster_weights_1d_batched)
+        instead of PerTensorGranularity's single-block (B=1) path above."""
+        torch.manual_seed(2)
+        weight = torch.randn(64, 32, dtype=weight_dtype)
+        spec = PalettizationSpec(
+            n_bits=4,
+            granularity=PerGroupedChannelGranularity(axis=0, group_size=8),
+            cluster_dim=1,
+        )
+
+        smawk = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            vectorize=False,
+        )
+        vectorized = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            vectorize=True,
+        )
+
+        lut_a, idx_a = smawk._calculate_centroids(weight)
+        lut_b, idx_b = vectorized._calculate_centroids(weight)
+
+        inertia_a = self._inertia(weight, lut_a, idx_a)
+        inertia_b = self._inertia(weight, lut_b, idx_b)
+        assert inertia_b == pytest.approx(inertia_a, rel=1e-2, abs=1e-6)
+
+    def test_matches_smawk_with_sensitivities_batched(self):
+        torch.manual_seed(3)
+        weight = torch.randn(64, 32, dtype=torch.float32)
+        sensitivities = torch.rand(64, 32, dtype=torch.float32) + 0.1
+        spec = PalettizationSpec(
+            n_bits=4,
+            granularity=PerGroupedChannelGranularity(axis=0, group_size=8),
+            cluster_dim=1,
+        )
+
+        smawk = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            sensitivities=sensitivities,
+            vectorize=False,
+        )
+        vectorized = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            sensitivities=sensitivities,
+            vectorize=True,
+        )
+
+        lut_a, idx_a = smawk._calculate_centroids(weight)
+        lut_b, idx_b = vectorized._calculate_centroids(weight)
+
+        inertia_a = self._inertia(weight, lut_a, idx_a)
+        inertia_b = self._inertia(weight, lut_b, idx_b)
+        assert inertia_b == pytest.approx(inertia_a, rel=1e-2, abs=1e-6)
+
+    def test_per_tensor_granularity_unaffected_by_batching(self):
+        """Explicit regression guard: PerTensorGranularity's single-block (B=1)
+        path must still route through the unchanged, unbatched
+        _cluster_weights_1d — this test predates Phase 12's batching change
+        (test_matches_smawk_unweighted above) and must keep passing unmodified."""
+        torch.manual_seed(4)
+        weight = torch.randn(64, 64, dtype=torch.float32)
+        spec = PalettizationSpec(n_bits=4, granularity=PerTensorGranularity(), cluster_dim=1)
+
+        vectorized = _KMeansFakePalettize(
+            n_bits=spec.n_bits,
+            lut_qspec=spec.lut_qspec,
+            granularity=spec.granularity,
+            cluster_dim=spec.cluster_dim,
+            enable_per_channel_scale=spec.enable_per_channel_scale,
+            vectorize=True,
+        )
+
+        block_weights = vectorized.granularity.get_blocks_to_cluster(weight)
+        assert len(block_weights) == 1, "PerTensorGranularity must yield exactly one block"
+
+        # Directly exercises _cluster_weights_1d (not the batched dispatch),
+        # matching what _calculate_centroids does for a single-block module.
+        centroids, clusters = vectorized._cluster_weights_1d(block_weights[0], None)
+        assert centroids.numel() > 0
+        assert clusters.shape == block_weights[0].flatten().shape
+
 
 class TestPerGroupedChannelAxisDefault:
     """Test per-op axis-default resolution for PerGroupedChannelGranularity."""

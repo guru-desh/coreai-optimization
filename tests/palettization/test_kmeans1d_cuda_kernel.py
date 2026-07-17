@@ -104,3 +104,78 @@ class TestKmeans1DCudaKernel:
             rtol=_RTOL,
             atol=1e-9,
         )
+
+
+class TestKmeans1DCudaKernelBatched:
+    """Parity tests: `core_cuda_kernel.cluster_batched` vs. B sequential
+    `core_cuda_kernel.cluster` calls. Every problem in a batch shares `k`
+    (the batched kernel's scope limit) but may have its own `n_p`."""
+
+    @pytest.mark.parametrize("num_problems", [1, 2, 8, 64])
+    def test_matches_sequential_unweighted(self, num_problems):
+        rng = np.random.default_rng(num_problems)
+        k = 4
+        # Deliberately varying n per problem, including one n_p == k edge
+        # case, to exercise the batched kernel's per-problem indexing.
+        n_values = [k] + [rng.integers(k, 200) for _ in range(num_problems - 1)]
+        arrays = [rng.standard_normal(n) for n in n_values]
+
+        sequential = [_kmeans1d.cluster_cuda_kernel(torch.from_numpy(a), k) for a in arrays]
+        batched = _kmeans1d.cluster_cuda_kernel_batched([torch.from_numpy(a) for a in arrays], k)
+
+        for array, seq_result, batch_result in zip(arrays, sequential, batched, strict=True):
+            seq_inertia = _inertia(
+                array, None, seq_result.clusters.cpu().numpy(), seq_result.centroids.cpu().numpy()
+            )
+            batch_inertia = _inertia(
+                array,
+                None,
+                batch_result.clusters.cpu().numpy(),
+                batch_result.centroids.cpu().numpy(),
+            )
+            np.testing.assert_allclose(batch_inertia, seq_inertia, rtol=_RTOL, atol=1e-9)
+
+    @pytest.mark.parametrize("num_problems", [1, 2, 8, 64])
+    def test_matches_sequential_weighted(self, num_problems):
+        rng = np.random.default_rng(1000 + num_problems)
+        k = 4
+        n_values = [k] + [rng.integers(k, 200) for _ in range(num_problems - 1)]
+        arrays = [rng.standard_normal(n) for n in n_values]
+        weight_arrays = [rng.choice([1.0, 2.0, 3.0, 4.0], size=n) for n in n_values]
+
+        sequential = [
+            _kmeans1d.cluster_cuda_kernel(torch.from_numpy(a), k, weights=torch.from_numpy(w))
+            for a, w in zip(arrays, weight_arrays, strict=True)
+        ]
+        batched = _kmeans1d.cluster_cuda_kernel_batched(
+            [torch.from_numpy(a) for a in arrays],
+            k,
+            weights_list=[torch.from_numpy(w) for w in weight_arrays],
+        )
+
+        for array, weights, seq_result, batch_result in zip(
+            arrays, weight_arrays, sequential, batched, strict=True
+        ):
+            seq_inertia = _inertia(
+                array,
+                weights,
+                seq_result.clusters.cpu().numpy(),
+                seq_result.centroids.cpu().numpy(),
+            )
+            batch_inertia = _inertia(
+                array,
+                weights,
+                batch_result.clusters.cpu().numpy(),
+                batch_result.centroids.cpu().numpy(),
+            )
+            np.testing.assert_allclose(batch_inertia, seq_inertia, rtol=_RTOL, atol=1e-9)
+
+    def test_rejects_n_below_k(self):
+        # The batched kernel's scope limit (see cluster_batched's docstring):
+        # every problem must satisfy n_p >= k, since k is shared across the
+        # whole batch's DP-layer loop count.
+        rng = np.random.default_rng(7)
+        k = 8
+        arrays = [rng.standard_normal(20), rng.standard_normal(k - 1)]
+        with pytest.raises(AssertionError):
+            _kmeans1d.cluster_cuda_kernel_batched([torch.from_numpy(a) for a in arrays], k)
