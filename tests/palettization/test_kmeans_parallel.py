@@ -271,3 +271,148 @@ class TestCrossLayerParallel:
                 seq_palettizer._model(simple_model_input),
                 par_palettizer._model(simple_model_input),
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestWholeModelBatching:
+    """Verify vectorize=True modules routed through the whole-model GPU
+    batching path (``_cluster_group_batched``, bypassing the multiprocessing
+    pool) produce results consistent with the sequential per-module path,
+    and that SMAWK modules sharing a model with vectorize=True modules are
+    unaffected -- see the batching investigation's Phase 14."""
+
+    def test_mixed_vectorize_and_smawk_matches_sequential(
+        self, simple_conv_linear_model, simple_model_input
+    ):
+        """``simple_conv_linear_model``'s conv (SMAWK) and linear
+        (vectorize=True, multi-block) must both match a fully-sequential
+        (``num_workers=1``) run when palettized in parallel."""
+        config = KMeansPalettizerConfig(
+            global_config=ModuleKMeansPalettizerConfig(
+                op_state_spec={
+                    "weight": PalettizationSpec(
+                        n_bits=4,
+                        granularity=PerGroupedChannelGranularity(group_size=2, axis=0),
+                        cluster_dim=1,
+                    )
+                },
+                vectorize=True,
+            ),
+            module_type_configs={
+                torch.nn.Conv2d: ModuleKMeansPalettizerConfig(
+                    op_state_spec={
+                        "weight": PalettizationSpec(
+                            n_bits=4, granularity=PerTensorGranularity(), cluster_dim=1
+                        )
+                    },
+                    vectorize=False,
+                ),
+            },
+        )
+
+        seq_model = copy.deepcopy(simple_conv_linear_model)
+        par_model = copy.deepcopy(simple_conv_linear_model)
+
+        seq_palettizer = KMeansPalettizer(seq_model, config)
+        seq_palettizer.prepare((simple_model_input,), num_workers=1)
+
+        par_palettizer = KMeansPalettizer(par_model, config)
+        par_palettizer.prepare((simple_model_input,), num_workers=2)
+
+        for name in ("conv", "linear"):
+            seq_fp = _collect_fake_palettize_modules(dict(seq_model.named_modules())[name])[0]
+            par_fp = _collect_fake_palettize_modules(dict(par_model.named_modules())[name])[0]
+            assert seq_fp.lut is not None and par_fp.lut is not None
+            torch.testing.assert_close(seq_fp.indices, par_fp.indices)
+            torch.testing.assert_close(seq_fp.lut, par_fp.lut, rtol=1e-6, atol=1e-6)
+
+        with torch.no_grad():
+            seq_out = seq_model(simple_model_input)
+            par_out = par_model(simple_model_input)
+        torch.testing.assert_close(seq_out, par_out, rtol=1e-6, atol=1e-6)
+
+    def test_multiple_vectorize_modules_sharing_k_matches_sequential(
+        self, gated_mlp_model, gated_mlp_model_input
+    ):
+        """``gated_mlp_model``'s three Linear layers (gate_proj, up_proj,
+        down_proj) all share n_bits, so the whole-model batching path groups
+        all of them into a single cross-module batched CUDA kernel call.
+        Must still match the fully-sequential (``num_workers=1``) output."""
+        config = KMeansPalettizerConfig(
+            global_config=ModuleKMeansPalettizerConfig(
+                op_state_spec={
+                    "weight": PalettizationSpec(
+                        n_bits=4,
+                        granularity=PerGroupedChannelGranularity(group_size=8, axis=0),
+                        cluster_dim=1,
+                    )
+                },
+                vectorize=True,
+            )
+        )
+
+        seq_model = copy.deepcopy(gated_mlp_model)
+        par_model = copy.deepcopy(gated_mlp_model)
+
+        seq_palettizer = KMeansPalettizer(seq_model, config)
+        seq_palettizer.prepare((gated_mlp_model_input,), num_workers=1)
+
+        par_palettizer = KMeansPalettizer(par_model, config)
+        par_palettizer.prepare((gated_mlp_model_input,), num_workers=2)
+
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            seq_fp = _collect_fake_palettize_modules(dict(seq_model.named_modules())[name])[0]
+            par_fp = _collect_fake_palettize_modules(dict(par_model.named_modules())[name])[0]
+            torch.testing.assert_close(seq_fp.indices, par_fp.indices)
+            torch.testing.assert_close(seq_fp.lut, par_fp.lut, rtol=1e-6, atol=1e-6)
+
+        with torch.no_grad():
+            seq_out = seq_model(gated_mlp_model_input)
+            par_out = par_model(gated_mlp_model_input)
+        torch.testing.assert_close(seq_out, par_out, rtol=1e-6, atol=1e-6)
+
+    def test_smawk_module_unaffected_by_sibling_vectorize_modules(
+        self, simple_conv_linear_model, simple_model_input
+    ):
+        """The conv (SMAWK, pool-dispatched) module must produce identical
+        results whether or not a sibling vectorize=True module is present
+        in the same model -- isolation check for Phase 14's partition of
+        ``_calculate_centroids_parallel``'s dispatch."""
+        conv_spec = ModuleKMeansPalettizerConfig(
+            op_state_spec={
+                "weight": PalettizationSpec(
+                    n_bits=4, granularity=PerTensorGranularity(), cluster_dim=1
+                )
+            },
+            vectorize=False,
+        )
+        conv_only_config = KMeansPalettizerConfig(
+            global_config=None,
+            module_type_configs={torch.nn.Conv2d: conv_spec},
+        )
+        mixed_config = KMeansPalettizerConfig(
+            global_config=ModuleKMeansPalettizerConfig(
+                op_state_spec={
+                    "weight": PalettizationSpec(
+                        n_bits=4,
+                        granularity=PerGroupedChannelGranularity(group_size=2, axis=0),
+                        cluster_dim=1,
+                    )
+                },
+                vectorize=True,
+            ),
+            module_type_configs={torch.nn.Conv2d: conv_spec},
+        )
+
+        conv_only_model = copy.deepcopy(simple_conv_linear_model)
+        mixed_model = copy.deepcopy(simple_conv_linear_model)
+
+        KMeansPalettizer(conv_only_model, conv_only_config).prepare(
+            (simple_model_input,), num_workers=2
+        )
+        KMeansPalettizer(mixed_model, mixed_config).prepare((simple_model_input,), num_workers=2)
+
+        conv_only_fp = _collect_fake_palettize_modules(conv_only_model.conv)[0]
+        mixed_fp = _collect_fake_palettize_modules(mixed_model.conv)[0]
+        torch.testing.assert_close(conv_only_fp.lut, mixed_fp.lut)
+        torch.testing.assert_close(conv_only_fp.indices, mixed_fp.indices)
