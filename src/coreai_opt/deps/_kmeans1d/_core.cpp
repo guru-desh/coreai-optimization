@@ -26,99 +26,12 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <numeric>
-#include <unordered_map>
 #include <vector>
 
 using namespace std;
 
 typedef unsigned long ulong;
-
-/*
- *  Internal implementation of the SMAWK algorithm.
- */
-template <typename T>
-void _smawk(
-        const vector<ulong>& rows,
-        const vector<ulong>& cols,
-        const function<T(ulong, ulong)>& lookup,
-        vector<ulong>* result) {
-    // Recursion base case
-    if (rows.size() == 0) return;
-
-    // ********************************
-    // * REDUCE
-    // ********************************
-
-    vector<ulong> _cols;  // Stack of surviving columns
-    for (ulong col : cols) {
-        while (true) {
-            if (_cols.size() == 0) break;
-            ulong row = rows[_cols.size() - 1];
-            if (lookup(row, col) >= lookup(row, _cols.back()))
-                break;
-            _cols.pop_back();
-        }
-        if (_cols.size() < rows.size())
-            _cols.push_back(col);
-    }
-
-    // Call recursively on odd-indexed rows
-    vector<ulong> odd_rows;
-    for (ulong i = 1; i < rows.size(); i += 2) {
-        odd_rows.push_back(rows[i]);
-    }
-    _smawk(odd_rows, _cols, lookup, result);
-
-    unordered_map<ulong, ulong> col_idx_lookup;
-    for (ulong idx = 0; idx < _cols.size(); ++idx) {
-        col_idx_lookup[_cols[idx]] = idx;
-    }
-
-    // ********************************
-    // * INTERPOLATE
-    // ********************************
-
-    // Fill-in even-indexed rows
-    ulong start = 0;
-    for (ulong r = 0; r < rows.size(); r += 2) {
-        ulong row = rows[r];
-        ulong stop = _cols.size() - 1;
-        if (r < rows.size() - 1)
-            stop = col_idx_lookup[(*result)[rows[r + 1]]];
-        ulong argmin = _cols[start];
-        T min = lookup(row, argmin);
-        for (ulong c = start + 1; c <= stop; ++c) {
-            T value = lookup(row, _cols[c]);
-            if (c == start || value < min) {
-                argmin = _cols[c];
-                min = value;
-            }
-        }
-        (*result)[row] = argmin;
-        start = stop;
-    }
-}
-
-/*
- *  Interface for the SMAWK algorithm, for finding the minimum value in each row
- *  of an implicitly-defined totally monotone matrix.
- */
-template <typename T>
-vector<ulong> smawk(
-        const ulong num_rows,
-        const ulong num_cols,
-        const function<T(ulong, ulong)>& lookup) {
-    vector<ulong> result;
-    result.resize(num_rows);
-    vector<ulong> rows(num_rows);
-    iota(begin(rows), end(rows), 0);
-    vector<ulong> cols(num_cols);
-    iota(begin(cols), end(cols), 0);
-    _smawk<T>(rows, cols, lookup, &result);
-    return result;
-}
 
 /*
  *  Calculates cluster costs in O(1) using prefix sum arrays.
@@ -219,6 +132,79 @@ class Matrix {
     }
 };
 
+// Fills row k_ of the DP (D_out/T_out, size n) from row k_-1 (D_prev), using
+// Wilber's O(n log n) stack-based technique for the row-minimization
+// subproblem SMAWK also solves, as an alternative to SMAWK's matrix-search
+// recursion. Reformulating cluster_impl's per-cell recurrence
+//   C(i,j) = D_prev[i<j-1 ? i : j-1] + calc(j,i)
+// by cases on j shows only 2 shapes actually matter: j in [1,i] is a real
+// split (last cluster = [j,i], cost D_prev[j-1] + calc(j,i)); every j
+// outside that range collapses to the constant D_prev[i] (an unused/empty
+// last cluster -- how the DP naturally represents "k_ clusters aren't all
+// needed yet"). So D_out[i] = min(D_prev[i], min_{j=1}^{i} (D_prev[j-1] +
+// calc(j,i))), and the inner min is the classical concave-1D-DP-speedup
+// shape: candidate j becomes available exactly at row i=j, and (by the
+// quadrangle inequality calc() satisfies) each candidate's domain of
+// optimality is a contiguous range of rows, discovered here via a
+// monotonic stack of candidates plus binary search for each new
+// candidate's crossover point against the current stack top.
+template <typename CostCalculatorType>
+void wilber_fill_row(
+        ulong n,
+        const vector<double>& D_prev,
+        CostCalculatorType& cost_calculator,
+        vector<double>* D_out,
+        vector<ulong>* T_out) {
+    vector<ulong> cand;   // candidate split points j, increasing
+    vector<ulong> start;  // start[t] = first row where cand[t] is optimal
+    ulong front = 0;
+
+    auto value_at = [&](ulong j, ulong row) -> double {
+        return D_prev[j - 1] + cost_calculator.calc(j, row);
+    };
+
+    for (ulong i = 0; i < n; ++i) {
+        ulong new_j = i + 1;
+        while (!cand.empty()) {
+            ulong top_j = cand.back();
+            ulong top_start = start.back();
+            if (value_at(new_j, top_start) <= value_at(top_j, top_start)) {
+                cand.pop_back();
+                start.pop_back();
+                if (front > cand.size()) front = cand.empty() ? 0 : cand.size() - 1;
+            } else {
+                break;
+            }
+        }
+        ulong lo = max(new_j, cand.empty() ? new_j : start.back());
+        ulong hi = n;
+        if (!cand.empty()) {
+            ulong top_j = cand.back();
+            while (lo < hi) {
+                ulong mid = lo + (hi - lo) / 2;
+                if (value_at(new_j, mid) <= value_at(top_j, mid)) hi = mid;
+                else lo = mid + 1;
+            }
+        }
+        if (lo < n) {
+            cand.push_back(new_j);
+            start.push_back(lo);
+        }
+        while (front + 1 < cand.size() && start[front + 1] <= i) front += 1;
+
+        bool have_real = !cand.empty() && start[front] <= i;
+        double real_cost = have_real ? value_at(cand[front], i) : 0.0;
+        double shortcut_cost = D_prev[i];
+        if (have_real && real_cost <= shortcut_cost) {
+            (*D_out)[i] = real_cost;
+            (*T_out)[i] = cand[front];
+        } else {
+            (*D_out)[i] = shortcut_cost;
+            (*T_out)[i] = i + 1;
+        }
+    }
+}
+
 template <typename CostCalculatorType, typename... CostArgsTypes>
 void cluster_impl(
         const double* array,
@@ -248,7 +234,9 @@ void cluster_impl(
     // * Set D and T using dynamic programming algorithm
     // ***************************************************
 
-    // Algorithm as presented in section 2.2 of (Gronlund et al., 2017).
+    // Algorithm as presented in section 2.2 of (Gronlund et al., 2017), with
+    // SMAWK's matrix-search row-minimization replaced by Wilber's stack-based
+    // technique (wilber_fill_row) for the same subproblem.
 
     CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
     Matrix<double> D(k, n);
@@ -260,16 +248,14 @@ void cluster_impl(
     }
 
     for (ulong k_ = 1; k_ < k; ++k_) {
-        auto C = [&D, &k_, &cost_calculator](ulong i, ulong j) -> double {
-            ulong col = i < j - 1 ? i : j - 1;
-            return D.get(k_ - 1, col) + cost_calculator.calc(j, i);
-        };
-        vector<ulong> row_argmins = smawk<double>(n, n, C);
-        for (ulong i = 0; i < row_argmins.size(); ++i) {
-            ulong argmin = row_argmins[i];
-            double min = C(i, argmin);
-            D.set(k_, i, min);
-            T.set(k_, i, argmin);
+        vector<double> D_prev(n);
+        for (ulong i = 0; i < n; ++i) D_prev[i] = D.get(k_ - 1, i);
+        vector<double> D_row(n);
+        vector<ulong> T_row(n);
+        wilber_fill_row(n, D_prev, cost_calculator, &D_row, &T_row);
+        for (ulong i = 0; i < n; ++i) {
+            D.set(k_, i, D_row[i]);
+            T.set(k_, i, T_row[i]);
         }
     }
 
