@@ -251,7 +251,11 @@ void cluster_impl(
     // Algorithm as presented in section 2.2 of (Gronlund et al., 2017).
 
     CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
-    Matrix<double> D(k, n);
+    // D's recurrence only ever reads the immediately-previous row (see the
+    // capture of `prev_row` in `C` below), so only 2 rows need to be live at
+    // once instead of the full k -- ping-pong between them by parity of k_.
+    // T still needs the full k x n history for backtracking.
+    Matrix<double> D(2, n);
     Matrix<ulong> T(k, n);
 
     for (ulong i = 0; i < n; ++i) {
@@ -260,15 +264,17 @@ void cluster_impl(
     }
 
     for (ulong k_ = 1; k_ < k; ++k_) {
-        auto C = [&D, &k_, &cost_calculator](ulong i, ulong j) -> double {
+        ulong prev_row = (k_ - 1) % 2;
+        ulong curr_row = k_ % 2;
+        auto C = [&D, &prev_row, &cost_calculator](ulong i, ulong j) -> double {
             ulong col = i < j - 1 ? i : j - 1;
-            return D.get(k_ - 1, col) + cost_calculator.calc(j, i);
+            return D.get(prev_row, col) + cost_calculator.calc(j, i);
         };
         vector<ulong> row_argmins = smawk<double>(n, n, C);
         for (ulong i = 0; i < row_argmins.size(); ++i) {
             ulong argmin = row_argmins[i];
             double min = C(i, argmin);
-            D.set(k_, i, min);
+            D.set(curr_row, i, min);
             T.set(k_, i, argmin);
         }
     }
@@ -278,9 +284,9 @@ void cluster_impl(
     // ***************************************************
 
     // TODO: This step requires O(kn) memory usage due to saving the entire
-    //       T matrix. However, it can be modified so that the memory usage is O(n).
-    //       D and T would not need to be retained in full (D already doesn't need
-    //       to be fully retained, although it currently is).
+    //       T matrix (D no longer needs full retention as of the change above).
+    //       T could also be reduced to O(n) via a Hirschberg-style
+    //       divide-and-conquer reconstruction of the backtracking path.
     //       Details are in section 3 of (Grønlund et al., 2017).
 
     vector<double> sorted_clusters(n);
