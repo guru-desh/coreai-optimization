@@ -38,6 +38,12 @@
 // input this kernel reads is guaranteed complete before these kernels run,
 // with no explicit synchronization required. If a caller ever introduces a
 // custom stream anywhere in this call path, this assumption breaks silently.
+//
+// Also exports cluster_naive_dp_cuda_batched: a batched variant collapsing
+// B independent problems that SHARE `k` (intra-module batching -- see
+// kmeans_fake_palettize.py) into the SAME fixed launch count as a single
+// call above, amortizing per-call launch/sync overhead across the whole
+// batch. See its own section further down for the full design.
 
 #include <Python.h>
 
@@ -189,6 +195,158 @@ __global__ void backtrack_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Batched variant: collapses B independent problems SHARING `k` (but each
+// with its own `n_p`) into the SAME 2k+4 kernel launches used above for a
+// single problem, instead of B sequential calls to cluster_naive_dp_cuda.
+// Validated first in the internal-mirror harness's standalone microbenchmark
+// (batched-launch CUDA beat SMAWK by 13-17x and naive_cpp_dp by 65-77x
+// across 6 real-shape cells, correctness exact in every cell) before being
+// ported here unchanged. See that harness's _naive_dp_batched_cuda.cu for
+// the full design writeup; only the memory-layout summary is repeated here.
+//
+// Two coordinate spaces:
+// - "row-space" (size total_rows = sum of all n_p): sorted_values,
+//   sorted_weights, sorted_labels, row_to_problem, row_local_i, and each
+//   layer's split_index row are indexed here. `offsets[p]..offsets[p+1]` is
+//   problem p's own slice (offsets has num_problems + 1 entries).
+// - "prefix-space" (size prefix_len = total_rows + num_problems): cumw/
+//   cumsum/cumsum2/buf_a/buf_b are indexed here, since each problem's own
+//   prefix-sum array needs n_p + 1 entries. `poffsets[p] = offsets[p] + p`.
+//
+// `row_to_problem`/`row_local_i` are precomputed on the host (trivial from
+// `offsets`) and passed in, avoiding a device-side search/scan.
+//
+// Scope limit, not a general-purpose batched API: every problem in a batch
+// must share `k` and satisfy `n_p >= k` -- this is exactly what
+// kmeans_fake_palettize.py's batched dispatch guarantees by construction
+// (num_clusters is fixed per module, and real weight-block sizes are always
+// far larger than k for every module with more than one block; see
+// BENCHMARK_FINDINGS.md's shape-collection results). A module that
+// (hypothetically) violated this falls back to the unbatched path per-block
+// rather than calling this launcher -- see kmeans_fake_palettize.py.
+// ---------------------------------------------------------------------------
+
+__global__ void prefix_sums_kernel_batched(
+        const double* sorted_values, const double* sorted_weights,
+        const index_t* offsets, const index_t* poffsets,
+        double* cumw, double* cumsum, double* cumsum2, ulong num_problems) {
+    ulong p = blockIdx.x;
+    if (p >= num_problems || threadIdx.x != 0) return;
+
+    ulong row_start = (ulong)offsets[p];
+    ulong n_p = (ulong)offsets[p + 1] - row_start;
+    ulong pstart = (ulong)poffsets[p];
+
+    cumw[pstart] = 0.0;
+    cumsum[pstart] = 0.0;
+    cumsum2[pstart] = 0.0;
+    for (ulong i = 0; i < n_p; ++i) {
+        double x = sorted_values[row_start + i];
+        double w = sorted_weights[row_start + i];
+        cumw[pstart + i + 1] = cumw[pstart + i] + w;
+        cumsum[pstart + i + 1] = cumsum[pstart + i] + w * x;
+        cumsum2[pstart + i + 1] = cumsum2[pstart + i] + w * x * x;
+    }
+}
+
+__global__ void fill_kernel_batched(double* buf, ulong count, double value) {
+    for (ulong idx = blockIdx.x * blockDim.x + threadIdx.x; idx < count;
+         idx += blockDim.x * gridDim.x) {
+        buf[idx] = value;
+    }
+}
+
+// Sets each problem's own "index 0" slot in a prefix-space buffer to
+// `value` -- the batched generalization of fill_kernel's single-index
+// `<<<1, 1>>>(buf, 1, value)` usage above, since here there are
+// num_problems such indices (poffsets[0..num_problems-1]) instead of one.
+__global__ void set_base_case_kernel(
+        double* buf, const index_t* poffsets, ulong num_problems, double value) {
+    ulong p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= num_problems) return;
+    buf[poffsets[p]] = value;
+}
+
+// One block per flattened (problem, local-row) pair (blockIdx.x = global row
+// g in row-space). Looks up which problem/local-row this block owns, then
+// runs the identical cooperative row-minima search as dp_layer_kernel above,
+// addressed through that problem's own prefix-space slice (via `pstart`).
+__global__ void dp_layer_kernel_batched(
+        const double* cumw, const double* cumsum, const double* cumsum2,
+        const double* prev, double* cur, index_t* split_index_layer,
+        const index_t* poffsets, const index_t* row_to_problem,
+        const index_t* row_local_i, ulong total_rows) {
+    ulong g = blockIdx.x;
+    if (g >= total_rows) return;
+
+    ulong p = (ulong)row_to_problem[g];
+    ulong i = (ulong)row_local_i[g];
+    ulong pstart = (ulong)poffsets[p];
+
+    __shared__ double best_cost[THREADS_PER_BLOCK];
+    __shared__ index_t best_j[THREADS_PER_BLOCK];
+
+    double local_best_cost = DBL_MAX;
+    index_t local_best_j = 0;
+    for (ulong j = threadIdx.x; j <= i; j += blockDim.x) {
+        double seg = weighted_segment_cost(cumw + pstart, cumsum + pstart, cumsum2 + pstart, j, i);
+        double candidate = prev[pstart + j] + seg;
+        if (candidate < local_best_cost) {
+            local_best_cost = candidate;
+            local_best_j = (index_t)j;
+        }
+    }
+    best_cost[threadIdx.x] = local_best_cost;
+    best_j[threadIdx.x] = local_best_j;
+    __syncthreads();
+
+    for (ulong stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride &&
+            best_cost[threadIdx.x + stride] < best_cost[threadIdx.x]) {
+            best_cost[threadIdx.x] = best_cost[threadIdx.x + stride];
+            best_j[threadIdx.x] = best_j[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        cur[pstart + i + 1] = best_cost[0];
+        split_index_layer[g] = best_j[0];
+    }
+}
+
+// One block per problem p, single thread. Identical sequential walk to
+// backtrack_kernel above, re-based onto problem p's own row-space
+// (`offsets`) and prefix-space (`poffsets`) slices, writing into that
+// problem's own `(p, layer)` slot of the batched `centroids` output (shape
+// (num_problems, k), i.e. `centroids[p * k + (layer - 1)]`).
+__global__ void backtrack_kernel_batched(
+        const double* cumw, const double* cumsum, const index_t* split_index,
+        const index_t* offsets, const index_t* poffsets,
+        double* centroids, index_t* sorted_labels,
+        ulong num_problems, ulong k, ulong total_rows) {
+    ulong p = blockIdx.x;
+    if (p >= num_problems || threadIdx.x != 0) return;
+
+    ulong row_start = (ulong)offsets[p];
+    ulong n_p = (ulong)offsets[p + 1] - row_start;
+    ulong pstart = (ulong)poffsets[p];
+
+    ulong end = n_p;
+    for (ulong layer = k; layer >= 1; --layer) {
+        ulong global_row = row_start + (end - 1);
+        ulong j = (ulong)split_index[(layer - 1) * total_rows + global_row];
+        double weight_total = cumw[pstart + end] - cumw[pstart + j];
+        centroids[p * k + (layer - 1)] = (cumsum[pstart + end] - cumsum[pstart + j]) / weight_total;
+        for (ulong idx = j; idx < end; ++idx) {
+            sorted_labels[row_start + idx] = (index_t)(layer - 1);
+        }
+        end = j;
+        if (layer == 1) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host-side launcher. All arguments are device pointers (obtained by the
 // Python caller via tensor.data_ptr() and passed through ctypes as plain
 // integers) except `n`/`k`. Every kernel below launches on the default
@@ -239,6 +397,55 @@ void cluster_naive_dp_cuda(
     }
 
     backtrack_kernel<<<1, 1>>>(cumw, cumsum, split_index, centroids, sorted_labels, n, k);
+}
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+__declspec(dllexport)
+#endif
+void cluster_naive_dp_cuda_batched(
+        double* sorted_values,     // row-space, (total_rows,)
+        double* sorted_weights,    // row-space, (total_rows,)
+        index_t* offsets,          // row-space offsets, (num_problems + 1,)
+        index_t* poffsets,         // prefix-space offsets, (num_problems + 1,)
+        index_t* row_to_problem,   // row-space, (total_rows,) -- host-precomputed
+        index_t* row_local_i,      // row-space, (total_rows,) -- host-precomputed
+        double* cumw,              // scratch, prefix-space, (prefix_len,)
+        double* cumsum,            // scratch, prefix-space, (prefix_len,)
+        double* cumsum2,           // scratch, prefix-space, (prefix_len,)
+        double* buf_a,             // scratch, prefix-space, (prefix_len,)
+        double* buf_b,             // scratch, prefix-space, (prefix_len,)
+        index_t* split_index,      // output, (k, total_rows)
+        double* centroids,         // output, (num_problems * k,) == (num_problems, k)
+        index_t* sorted_labels,    // output, row-space, (total_rows,)
+        ulong num_problems,
+        ulong total_rows,
+        ulong prefix_len,
+        ulong k) {
+    prefix_sums_kernel_batched<<<num_problems, 1>>>(
+        sorted_values, sorted_weights, offsets, poffsets, cumw, cumsum, cumsum2, num_problems);
+
+    double* prev = buf_a;
+    double* cur = buf_b;
+
+    ulong fill_blocks = (prefix_len + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    fill_kernel_batched<<<fill_blocks, THREADS_PER_BLOCK>>>(prev, prefix_len, DBL_MAX);
+    ulong base_blocks = (num_problems + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    set_base_case_kernel<<<base_blocks, THREADS_PER_BLOCK>>>(prev, poffsets, num_problems, 0.0);
+
+    for (ulong layer = 1; layer <= k; ++layer) {
+        set_base_case_kernel<<<base_blocks, THREADS_PER_BLOCK>>>(cur, poffsets, num_problems, DBL_MAX);
+        dp_layer_kernel_batched<<<total_rows, THREADS_PER_BLOCK>>>(
+            cumw, cumsum, cumsum2, prev, cur,
+            split_index + (layer - 1) * total_rows,
+            poffsets, row_to_problem, row_local_i, total_rows);
+        double* tmp = prev;
+        prev = cur;
+        cur = tmp;
+    }
+
+    backtrack_kernel_batched<<<num_problems, 1>>>(
+        cumw, cumsum, split_index, offsets, poffsets, centroids, sorted_labels,
+        num_problems, k, total_rows);
 }
 
 } // extern "C"

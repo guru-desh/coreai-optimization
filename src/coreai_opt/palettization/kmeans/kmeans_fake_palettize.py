@@ -213,14 +213,28 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         indices = []
         num_clusters = 2**self.n_bits
 
-        for block_weight, block_sensitivity in zip(
-            block_weights_to_cluster, block_sensitivities, strict=True
-        ):
-            if self.cluster_dim == 1:
-                centroids, clusters = self._cluster_weights_1d(block_weight, block_sensitivity)
-            else:
-                centroids, clusters = self._cluster_weights_2d(block_weight, block_sensitivity)
+        if self.cluster_dim == 1 and self.vectorize and len(block_weights_to_cluster) > 1:
+            # Batches all of this module's blocks into one CUDA kernel-launch
+            # sequence instead of one per block -- see
+            # _cluster_weights_1d_batched's docstring. PerTensorGranularity's
+            # single-block case (len == 1) and vectorize=False both keep
+            # using the existing per-block loop below unchanged.
+            cluster_outputs = self._cluster_weights_1d_batched(
+                block_weights_to_cluster, block_sensitivities
+            )
+        else:
+            cluster_outputs = [
+                self._cluster_weights_1d(block_weight, block_sensitivity)
+                if self.cluster_dim == 1
+                else self._cluster_weights_2d(block_weight, block_sensitivity)
+                for block_weight, block_sensitivity in zip(
+                    block_weights_to_cluster, block_sensitivities, strict=True
+                )
+            ]
 
+        for block_weight, (centroids, clusters) in zip(
+            block_weights_to_cluster, cluster_outputs, strict=True
+        ):
             centroids = self._pad_lut_to_num_clusters(centroids, num_clusters)
 
             lut.append(centroids.to(weight.dtype))
@@ -505,6 +519,96 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         clusters = torch.from_numpy(np.array(kmeans_results.clusters))
 
         return centroids, clusters
+
+    def _cluster_weights_1d_batched(
+        self,
+        block_weights: list[torch.Tensor],
+        block_sensitivities: list[torch.Tensor | None],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Batched version of ``_cluster_weights_1d``: clusters every block of a
+        module in a single ``_kmeans1d.cluster_cuda_kernel_batched()`` call
+        instead of one ``_kmeans1d.cluster_cuda_kernel()`` call per block,
+        amortizing CUDA kernel-launch/host-sync overhead across all of a
+        module's blocks (see ``core_cuda_kernel.cluster_batched()``'s
+        docstring for the validated speedup). Only called when
+        ``self.vectorize`` is True and the module has more than one block
+        (``PerGroupedChannelGranularity``); per-block preprocessing (bf16
+        cast, fast-kmeans-mode dedup) exactly mirrors ``_cluster_weights_1d``.
+        """
+        num_clusters = 2**self.n_bits
+        values_list = []
+        weights_list = []
+        # Per-block np.unique() dedup indices, if the fast-kmeans-mode path
+        # was used for that block (None otherwise), needed to expand that
+        # block's batched result back to per-weight assignments.
+        expand_indices: list[np.ndarray | None] = []
+
+        for block_weight, block_sensitivity in zip(block_weights, block_sensitivities, strict=True):
+            if block_weight.dtype == torch.bfloat16:
+                block_weight = block_weight.float()
+
+            block_weight_flatten = block_weight.flatten().numpy()
+            if block_sensitivity is not None:
+                block_sensitivity_flatten = block_sensitivity.flatten().numpy()
+            else:
+                block_sensitivity_flatten = None
+
+            if (block_weight_flatten.dtype == np.float16) or (
+                self.enable_fast_kmeans_mode
+                and (np.max(block_weight_flatten)) <= np.finfo(np.float16).max
+                and np.min(block_weight_flatten) >= np.finfo(np.float16).min
+            ):
+                values, block_indices, counts = self._reduce_weights_to_cluster(
+                    block_weight_flatten
+                )
+                if block_sensitivity_flatten is not None:
+                    counts = np.bincount(block_indices, weights=block_sensitivity_flatten)
+                values_list.append(torch.from_numpy(values))
+                weights_list.append(torch.from_numpy(counts))
+                expand_indices.append(block_indices)
+            else:
+                values_list.append(torch.from_numpy(block_weight_flatten))
+                weights_list.append(
+                    torch.from_numpy(block_sensitivity_flatten)
+                    if block_sensitivity_flatten is not None
+                    else None
+                )
+                expand_indices.append(None)
+
+        # cluster_cuda_kernel_batched requires k <= n for every block in the
+        # batch (a shared k drives the whole batch's DP-layer loop count).
+        # Real weight-block sizes are always far larger than k for every
+        # module with more than one block (see BENCHMARK_FINDINGS.md's
+        # shape-collection results) -- this is a defensive fallback for an
+        # invariant that should never break, not a code path expected to
+        # actually run.
+        if min(len(v) for v in values_list) < num_clusters:
+            logger.warning(
+                "Batched CUDA kernel skipped: at least one block's post-dedup "
+                f"unique-value count is below num_clusters ({num_clusters}), which "
+                "the batched kernel does not support (shared k across the whole "
+                "batch). Falling back to sequential single-block clustering."
+            )
+            cuda_results_batch = [
+                _kmeans1d.cluster_cuda_kernel(
+                    values, min(len(values), num_clusters), weights=weights
+                )
+                for values, weights in zip(values_list, weights_list, strict=True)
+            ]
+        else:
+            cuda_results_batch = _kmeans1d.cluster_cuda_kernel_batched(
+                values_list, num_clusters, weights_list=weights_list
+            )
+
+        outputs = []
+        for cuda_results, block_indices in zip(cuda_results_batch, expand_indices, strict=True):
+            centroids = cuda_results.centroids.to("cpu")
+            clusters = cuda_results.clusters.to("cpu")
+            if block_indices is not None:
+                clusters = clusters[torch.from_numpy(block_indices)]
+            outputs.append((centroids, clusters))
+        return outputs
 
     def _cluster_weights_2d(
         self,

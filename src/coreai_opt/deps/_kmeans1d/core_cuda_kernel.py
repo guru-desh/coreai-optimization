@@ -122,3 +122,129 @@ def cluster(
     labels = torch.empty(n, dtype=torch.int64, device=device)
     labels[order] = sorted_labels
     return Clustered(clusters=labels, centroids=centroids)
+
+
+def cluster_batched(
+    values_list: list[torch.Tensor],
+    k: int,
+    *,
+    weights_list: list[torch.Tensor | None] | None = None,
+) -> list[Clustered]:
+    """Cluster B independent 1-D problems sharing `k` into ONE kernel-launch
+    sequence, instead of B sequential calls to `cluster()`.
+
+    Validated in the internal-mirror harness's standalone microbenchmark
+    (batched-launch CUDA beat SMAWK by 13-17x and the shipped C++ backend by
+    65-77x across 6 real-shape cells drawn from production models, exact
+    correctness in every cell) before being ported here unchanged.
+
+    Every problem must satisfy ``n_p >= k`` -- unlike `cluster()`, this
+    kernel does not implement a per-problem `k = min(k, n)` clamp, since a
+    shared `k` drives the whole batch's DP-layer loop count. This is not a
+    real constraint in practice: `kmeans_fake_palettize.py` only calls this
+    for modules where `num_clusters` is fixed per instance and every block's
+    post-dedup `n` is far larger than `k` (see BENCHMARK_FINDINGS.md's
+    shape-collection results) -- callers must fall back to `cluster()` per
+    block if that invariant is ever violated for a given module.
+
+    :param values_list: List of B 1-D tensors of values to cluster, one per
+        problem, in any order within each.
+    :param k: Shared number of clusters for every problem in the batch.
+    :param weights_list: Optional list of B per-point weight tensors (same
+        length as the corresponding `values_list` entry), or `None` per
+        problem for unweighted. `None` (the whole argument) is equivalent to
+        an all-`None` list.
+    :return: A list of B `Clustered(clusters, centroids)` namedtuples (CUDA
+        tensors, `dtype=torch.float64`), in the same order as `values_list`.
+    """
+    n = len(values_list)
+    assert n > 0
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "core_cuda_kernel.cluster_batched() requires CUDA; no CUDA device is available."
+        )
+    if weights_list is None:
+        weights_list = [None] * n
+
+    device = "cuda"
+    dtype = torch.float64
+
+    sorted_values_list = []
+    sorted_weights_list = []
+    n_list = []
+    orders = []
+    for values, weights in zip(values_list, weights_list, strict=True):
+        values = values.to(device=device, dtype=dtype)
+        n_p = int(values.shape[0])
+        assert n_p > 0, f"Invalid problem size: {n_p}"
+        assert k <= n_p, (
+            f"cluster_batched() requires k <= n for every problem in the batch "
+            f"(k={k}, n={n_p}); see docstring for why this is not expected in practice"
+        )
+        sorted_values, order = torch.sort(values, stable=True)
+        sorted_weights = (
+            torch.ones(n_p, dtype=dtype, device=device)
+            if weights is None
+            else weights.to(device=device, dtype=dtype)[order]
+        )
+        sorted_values_list.append(sorted_values)
+        sorted_weights_list.append(sorted_weights)
+        n_list.append(n_p)
+        orders.append(order)
+
+    n_tensor = torch.tensor(n_list, dtype=torch.int64, device=device)
+    offsets = torch.cat(
+        [torch.zeros(1, dtype=torch.int64, device=device), torch.cumsum(n_tensor, dim=0)]
+    )
+    poffsets = offsets + torch.arange(n + 1, dtype=torch.int64, device=device)
+    total_rows = int(offsets[-1].item())
+    prefix_len = int(poffsets[-1].item())
+
+    sorted_values = torch.cat(sorted_values_list)
+    sorted_weights = torch.cat(sorted_weights_list)
+    row_to_problem = torch.repeat_interleave(
+        torch.arange(n, dtype=torch.int64, device=device), n_tensor
+    )
+    row_local_i = torch.cat([torch.arange(n_p, dtype=torch.int64, device=device) for n_p in n_list])
+
+    cumw = torch.empty(prefix_len, dtype=dtype, device=device)
+    cumsum = torch.empty(prefix_len, dtype=dtype, device=device)
+    cumsum2 = torch.empty(prefix_len, dtype=dtype, device=device)
+    buf_a = torch.empty(prefix_len, dtype=dtype, device=device)
+    buf_b = torch.empty(prefix_len, dtype=dtype, device=device)
+    split_index = torch.empty((k, total_rows), dtype=torch.int64, device=device)
+    centroids = torch.empty(n * k, dtype=dtype, device=device)
+    sorted_labels = torch.empty(total_rows, dtype=torch.int64, device=device)
+
+    _dll().cluster_naive_dp_cuda_batched(
+        ctypes.c_void_p(sorted_values.data_ptr()),
+        ctypes.c_void_p(sorted_weights.data_ptr()),
+        ctypes.c_void_p(offsets.data_ptr()),
+        ctypes.c_void_p(poffsets.data_ptr()),
+        ctypes.c_void_p(row_to_problem.data_ptr()),
+        ctypes.c_void_p(row_local_i.data_ptr()),
+        ctypes.c_void_p(cumw.data_ptr()),
+        ctypes.c_void_p(cumsum.data_ptr()),
+        ctypes.c_void_p(cumsum2.data_ptr()),
+        ctypes.c_void_p(buf_a.data_ptr()),
+        ctypes.c_void_p(buf_b.data_ptr()),
+        ctypes.c_void_p(split_index.data_ptr()),
+        ctypes.c_void_p(centroids.data_ptr()),
+        ctypes.c_void_p(sorted_labels.data_ptr()),
+        ctypes.c_ulong(n),
+        ctypes.c_ulong(total_rows),
+        ctypes.c_ulong(prefix_len),
+        ctypes.c_ulong(k),
+    )
+
+    results = []
+    for idx in range(n):
+        n_p = n_list[idx]
+        row_start = int(offsets[idx].item())
+        row_end = int(offsets[idx + 1].item())
+        order = orders[idx]
+        labels = torch.empty(n_p, dtype=torch.int64, device=device)
+        labels[order] = sorted_labels[row_start:row_end]
+        problem_centroids = centroids[idx * k : (idx + 1) * k]
+        results.append(Clustered(clusters=labels, centroids=problem_centroids))
+    return results
