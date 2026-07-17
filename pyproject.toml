@@ -34,6 +34,8 @@ dependencies = [
     # Required at runtime by torch.utils.cpp_extension to JIT-compile the vendored
     # kmeans1d C++ core (a C++ toolchain must also be present on the host).
     "ninja>=1.11",
+    # Round-5 numba-vs-C++ experiment: JIT-compiles deps/_kmeans1d's numba backend.
+    "numba>=0.60",
     "numpy>=2",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
