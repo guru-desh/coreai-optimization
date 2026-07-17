@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from os import PathLike
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.utils.parametrize as P
@@ -34,9 +35,14 @@ from coreai_opt.common import ExportBackend
 from coreai_opt.config.compression_config import ModuleCompressionConfig
 from coreai_opt.config.spec import CompressionTargetTensor
 from coreai_opt.config.spec.base import CompressionSpec
+from coreai_opt.deps import _kmeans1d
 from coreai_opt.palettization.base_palettizer import _BasePalettizer
 from coreai_opt.palettization.config.palettization_config import (
     KMeansPalettizerConfig,
+)
+from coreai_opt.palettization.spec.errors import (
+    _IncompatibleClusterDimError,
+    _IncompatibleGranularityError,
 )
 from coreai_opt.palettization.spec.fake_palettize import (
     _disable_fake_palett,
@@ -101,6 +107,114 @@ def _calculate_centroids_for_module(
         fp_module._disabled_reason = f"layer {layer_name!r}"
 
     return fp_module
+
+
+def _cluster_group_batched(group: list[_FakePalettInfo]) -> None:
+    """Compute centroids for a group of ``vectorize=True`` modules that all
+    share ``k = 2 ** n_bits``, via a single cross-module
+    ``_kmeans1d.cluster_cuda_kernel_batched()`` call.
+
+    Runs in the parent process (no pool) -- the whole-model-batching
+    counterpart to ``_calculate_centroids_for_module``'s per-module forward
+    pass. Mutates each module's ``lut``/``indices`` in place, mirroring the
+    side effects of ``fp_module(weight)`` (``_FakePalettizeImplBase.forward``)
+    without going through a full forward pass.
+    """
+    prepared = []
+    for info in group:
+        fp_module = info.fp_module
+        if fp_module._disabled:
+            continue
+        try:
+            weight, block_weights, block_sensitivities, axis, num_clusters = (
+                fp_module._prepare_blocks_for_clustering(info.weight)
+            )
+        except _IncompatibleGranularityError as e:
+            logger.warning(
+                f"Tensor incompatible with granularity: {e}. Skipping palettization "
+                f"for layer {info.layer_name!r}."
+            )
+            fp_module._disabled = True
+            fp_module._disabled_reason = f"layer {info.layer_name!r}"
+            continue
+        except _IncompatibleClusterDimError as e:
+            logger.warning(
+                f"Tensor incompatible with cluster_dim: {e}. Skipping palettization "
+                f"for layer {info.layer_name!r}."
+            )
+            fp_module._disabled = True
+            fp_module._disabled_reason = f"layer {info.layer_name!r}"
+            continue
+        prepared.append((info, weight, block_weights, block_sensitivities, axis, num_clusters))
+
+    if not prepared:
+        return
+
+    k = prepared[0][5]
+
+    # Dedup every block of every module in the group, collecting them into
+    # one flat list for a single cluster_cuda_kernel_batched() call spanning
+    # the whole group instead of one call per module.
+    values_list: list[torch.Tensor] = []
+    weights_list: list[torch.Tensor | None] = []
+    expand_indices: list[np.ndarray | None] = []
+    blocks_per_module: list[int] = []
+    for info, _weight, block_weights, block_sensitivities, _axis, _num_clusters in prepared:
+        blocks_per_module.append(len(block_weights))
+        for block_weight, block_sensitivity in zip(block_weights, block_sensitivities, strict=True):
+            values, weights, block_indices = info.fp_module._dedup_block(
+                block_weight, block_sensitivity
+            )
+            values_list.append(values)
+            weights_list.append(weights)
+            expand_indices.append(block_indices)
+
+    # cluster_cuda_kernel_batched requires k <= n for every block in the
+    # batch. Real weight-block sizes are always far larger than k when a
+    # module has more than one block (see BENCHMARK_FINDINGS.md's
+    # shape-collection results) -- this is a defensive fallback for an
+    # invariant that should never break, not a path expected to run.
+    if min(len(v) for v in values_list) < k:
+        logger.warning(
+            f"Whole-model batched CUDA kernel skipped for a k={k} group: at least "
+            "one block's post-dedup unique-value count is below k, which the "
+            "batched kernel does not support. Falling back to sequential "
+            "single-block clustering for this group."
+        )
+        cuda_results_batch = [
+            _kmeans1d.cluster_cuda_kernel(values, min(len(values), k), weights=weights)
+            for values, weights in zip(values_list, weights_list, strict=True)
+        ]
+    else:
+        cuda_results_batch = _kmeans1d.cluster_cuda_kernel_batched(
+            values_list, k, weights_list=weights_list
+        )
+
+    # Split the flat per-block results back out per module, expand each
+    # block's own dedup indices, then assemble each module's LUT/indices
+    # exactly as _calculate_centroids would.
+    cursor = 0
+    for (info, weight, block_weights, _block_sensitivities, axis, num_clusters), n_blocks in zip(
+        prepared, blocks_per_module, strict=True
+    ):
+        cluster_outputs = []
+        for cuda_results, block_indices in zip(
+            cuda_results_batch[cursor : cursor + n_blocks],
+            expand_indices[cursor : cursor + n_blocks],
+            strict=True,
+        ):
+            centroids = cuda_results.centroids.to("cpu")
+            clusters = cuda_results.clusters.to("cpu")
+            if block_indices is not None:
+                clusters = clusters[torch.from_numpy(block_indices)]
+            cluster_outputs.append((centroids, clusters))
+        cursor += n_blocks
+
+        lut, indices = info.fp_module._assemble_lut_and_indices(
+            info.weight, weight, axis, block_weights, cluster_outputs, num_clusters
+        )
+        info.fp_module.lut = lut.detach()
+        info.fp_module.indices = indices.detach()
 
 
 class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
@@ -493,36 +607,71 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
         if not fp_info:
             return
 
-        # Cap worker count at the number of layers to avoid idle processes.
-        effective_workers = min(num_workers, len(fp_info))
-        logger.info(
-            f"Calculating centroids for {len(fp_info)} layers "
-            f"in parallel with {effective_workers} workers"
-        )
+        # vectorize=True, cluster_dim==1 modules skip the multiprocessing
+        # pool entirely and are clustered in this (parent) process instead,
+        # batched across modules that share k=2**n_bits to amortize CUDA
+        # kernel-launch overhead across the whole model. Every other module
+        # (SMAWK, or cluster_dim>1's EfficientKMeans, which vectorize doesn't
+        # affect) keeps using the pool path below, completely unchanged.
+        batched_info = [
+            info for info in fp_info if info.fp_module.vectorize and info.fp_module.cluster_dim == 1
+        ]
+        pool_info = [
+            info
+            for info in fp_info
+            if not (info.fp_module.vectorize and info.fp_module.cluster_dim == 1)
+        ]
 
-        # spawn (not fork) so workers don't inherit the parent's CUDA context
-        # or other process-global state.
-        pool_args = [(info.fp_module, info.weight, info.layer_name) for info in fp_info]
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(processes=effective_workers) as pool:
-            results = list(
-                tqdm(
-                    pool.imap(_calculate_centroids_for_module, pool_args),
-                    total=len(fp_info),
-                    desc=f"Palettizing layers (num_workers={num_workers})",
-                )
+        if pool_info:
+            # Cap worker count at the number of layers to avoid idle processes.
+            effective_workers = min(num_workers, len(pool_info))
+            logger.info(
+                f"Calculating centroids for {len(pool_info)} layers "
+                f"in parallel with {effective_workers} workers"
             )
 
-        for info, new_fp in zip(fp_info, results, strict=True):
-            if getattr(new_fp, "_disabled", False):
-                logger.warning(
-                    f"Disabling palettization for a module: "
-                    f"{getattr(new_fp, '_disabled_reason', '')}"
+            # spawn (not fork) so workers don't inherit the parent's CUDA
+            # context or other process-global state.
+            pool_args = [(info.fp_module, info.weight, info.layer_name) for info in pool_info]
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=effective_workers) as pool:
+                results = list(
+                    tqdm(
+                        pool.imap(_calculate_centroids_for_module, pool_args),
+                        total=len(pool_info),
+                        desc=f"Palettizing layers (num_workers={num_workers})",
+                    )
                 )
-            # ParametrizationList supports item assignment; this swaps the
-            # worker's mutated module into the live model without touching
-            # the surrounding parametrization registration.
-            info.module.parametrizations[info.attr_name][info.idx] = new_fp
+
+            for info, new_fp in zip(pool_info, results, strict=True):
+                if getattr(new_fp, "_disabled", False):
+                    logger.warning(
+                        f"Disabling palettization for a module: "
+                        f"{getattr(new_fp, '_disabled_reason', '')}"
+                    )
+                # ParametrizationList supports item assignment; this swaps the
+                # worker's mutated module into the live model without touching
+                # the surrounding parametrization registration.
+                info.module.parametrizations[info.attr_name][info.idx] = new_fp
+
+        if batched_info:
+            logger.info(
+                f"Calculating centroids for {len(batched_info)} vectorize=True "
+                "layers via whole-model GPU batching"
+            )
+            groups: dict[int, list[_FakePalettInfo]] = {}
+            for info in batched_info:
+                groups.setdefault(info.fp_module.n_bits, []).append(info)
+            for group in groups.values():
+                _cluster_group_batched(group)
+
+            for info in batched_info:
+                if getattr(info.fp_module, "_disabled", False):
+                    logger.warning(
+                        f"Disabling palettization for a module: "
+                        f"{getattr(info.fp_module, '_disabled_reason', '')}"
+                    )
+                info.module.parametrizations[info.attr_name][info.idx] = info.fp_module
 
     @staticmethod
     @contextmanager
