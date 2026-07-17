@@ -219,6 +219,122 @@ class Matrix {
     }
 };
 
+// Computes the full row of DP values for `count` clusters over `len`
+// (local) positions, given an arbitrary cost lookup `calc(a,b)` for local
+// indices a<=b in [0,len): result[i] = optimal cost of partitioning
+// local [0,i] into exactly `count` clusters under that cost function.
+// Identical recurrence and SMAWK usage (including the col=i<j-1?i:j-1
+// clamp for out-of-range candidates) to cluster_impl's original
+// single-pass loop -- only 2 rows of D are live at once (same technique
+// as the D-row-reduction change), so this uses O(len) space.
+template <typename CalcFn>
+vector<double> generic_dp_row(ulong len, ulong count, CalcFn&& calc) {
+    Matrix<double> D(2, len);
+    for (ulong i = 0; i < len; ++i) {
+        D.set(0, i, calc(0, i));
+    }
+    for (ulong k_ = 1; k_ < count; ++k_) {
+        ulong prev_row = (k_ - 1) % 2;
+        ulong curr_row = k_ % 2;
+        auto C = [&D, &prev_row, &calc](ulong i, ulong j) -> double {
+            ulong col = i < j - 1 ? i : j - 1;
+            return D.get(prev_row, col) + calc(j, i);
+        };
+        vector<ulong> row_argmins = smawk<double>(len, len, C);
+        for (ulong i = 0; i < row_argmins.size(); ++i) {
+            D.set(curr_row, i, C(i, row_argmins[i]));
+        }
+    }
+    ulong final_row = (count - 1) % 2;
+    vector<double> result(len);
+    for (ulong i = 0; i < len; ++i) result[i] = D.get(final_row, i);
+    return result;
+}
+
+// result[i] = optimal cost of partitioning [lo, lo+i] into `count` clusters.
+template <typename CostCalculatorType>
+vector<double> forward_dp_row(
+        CostCalculatorType& cost_calculator, ulong lo, ulong hi, ulong count) {
+    ulong len = hi - lo;
+    return generic_dp_row(len, count, [&cost_calculator, lo](ulong a, ulong b) {
+        return cost_calculator.calc(lo + a, lo + b);
+    });
+}
+
+// result[i] = optimal cost of partitioning [hi-1-i, hi-1] (the last i+1
+// elements of [lo, hi)) into `count` clusters. Computed by handing
+// generic_dp_row a cost lookup mirrored within [lo, hi) -- local index a
+// maps to global position hi-1-a, reversing order -- rather than deriving
+// a separate clamp for a "backward" recurrence: reusing forward's exact,
+// already-correct SMAWK/clamp logic under a reflected cost function avoids
+// re-deriving those invariants (and getting them subtly wrong) from scratch.
+template <typename CostCalculatorType>
+vector<double> backward_dp_row(
+        CostCalculatorType& cost_calculator, ulong lo, ulong hi, ulong count) {
+    ulong len = hi - lo;
+    return generic_dp_row(len, count, [&cost_calculator, hi](ulong a, ulong b) {
+        return cost_calculator.calc(hi - 1 - b, hi - 1 - a);
+    });
+}
+
+// Hirschberg-style divide-and-conquer reconstruction of the optimal
+// clustering, avoiding the O(kn) T matrix: recursively split the cluster
+// budget `count` in half, run a forward DP for the left half and a
+// backward DP for the right half (each O(hi-lo) space via the 2-row
+// technique), find where they meet at the true optimum, and recurse on
+// each side. O(kn) total time (a constant factor over the direct DP, per
+// section 3 of Gronlund et al., 2017), O(n) space overall since only one
+// "level" of forward/backward rows is live on the call stack at a time.
+template <typename CostCalculatorType>
+void hirschberg_solve(
+        CostCalculatorType& cost_calculator,
+        const vector<double>& sorted_array,
+        ulong lo, ulong hi, ulong count, ulong cluster_label_offset,
+        vector<double>& sorted_clusters, double* centroids) {
+    if (count == 1) {
+        // Base case: the whole [lo, hi) range is one cluster. Same
+        // incremental weighted-mean formula as the original backtracking
+        // loop, applied to this one segment.
+        double centroid = 0.0;
+        for (ulong i = lo; i < hi; ++i) {
+            sorted_clusters[i] = cluster_label_offset;
+            centroid += (
+                (sorted_array[i] - centroid)
+                * cost_calculator.weight(i, i)
+                / cost_calculator.weight(lo, i)
+            );
+        }
+        centroids[cluster_label_offset] = centroid;
+        return;
+    }
+
+    ulong mid_k = count / 2;
+    vector<double> fwd = forward_dp_row(cost_calculator, lo, hi, mid_k);
+    vector<double> bwd = backward_dp_row(cost_calculator, lo, hi, count - mid_k);
+
+    // Find split point m in [lo, hi) -- the last element of the left
+    // part -- minimizing fwd[m-lo] + bwd[hi-2-m], leaving enough elements
+    // on each side for their respective cluster counts.
+    ulong best_m = lo + mid_k - 1;
+    double best_cost = fwd[best_m - lo] + bwd[hi - 2 - best_m];
+    for (ulong m = lo + mid_k; m <= hi - 1 - (count - mid_k); ++m) {
+        double cost = fwd[m - lo] + bwd[hi - 2 - m];
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_m = m;
+        }
+    }
+
+    hirschberg_solve(
+        cost_calculator, sorted_array, lo, best_m + 1, mid_k,
+        cluster_label_offset, sorted_clusters, centroids
+    );
+    hirschberg_solve(
+        cost_calculator, sorted_array, best_m + 1, hi, count - mid_k,
+        cluster_label_offset + mid_k, sorted_clusters, centroids
+    );
+}
+
 template <typename CostCalculatorType, typename... CostArgsTypes>
 void cluster_impl(
         const double* array,
@@ -245,69 +361,18 @@ void cluster_impl(
     }
 
     // ***************************************************
-    // * Set D and T using dynamic programming algorithm
+    // * Set D and extract cluster assignments via Hirschberg's technique
     // ***************************************************
 
-    // Algorithm as presented in section 2.2 of (Gronlund et al., 2017).
+    // Algorithm as presented in section 2.2 of (Gronlund et al., 2017),
+    // with the backtracking step's O(kn) T matrix replaced by the
+    // divide-and-conquer reconstruction in hirschberg_solve() (section 3).
 
     CostCalculatorType cost_calculator(sorted_array, n, sort_idxs, args...);
-    Matrix<double> D(k, n);
-    Matrix<ulong> T(k, n);
-
-    for (ulong i = 0; i < n; ++i) {
-        D.set(0, i, cost_calculator.calc(0, i));
-        T.set(0, i, 0);
-    }
-
-    for (ulong k_ = 1; k_ < k; ++k_) {
-        auto C = [&D, &k_, &cost_calculator](ulong i, ulong j) -> double {
-            ulong col = i < j - 1 ? i : j - 1;
-            return D.get(k_ - 1, col) + cost_calculator.calc(j, i);
-        };
-        vector<ulong> row_argmins = smawk<double>(n, n, C);
-        for (ulong i = 0; i < row_argmins.size(); ++i) {
-            ulong argmin = row_argmins[i];
-            double min = C(i, argmin);
-            D.set(k_, i, min);
-            T.set(k_, i, argmin);
-        }
-    }
-
-    // ***************************************************
-    // * Extract cluster assignments by backtracking
-    // ***************************************************
-
-    // TODO: This step requires O(kn) memory usage due to saving the entire
-    //       T matrix. However, it can be modified so that the memory usage is O(n).
-    //       D and T would not need to be retained in full (D already doesn't need
-    //       to be fully retained, although it currently is).
-    //       Details are in section 3 of (Grønlund et al., 2017).
-
     vector<double> sorted_clusters(n);
-
-    ulong t = n;
-    ulong k_ = k - 1;
-    ulong n_ = n - 1;
-    // The do/while loop was used in place of:
-    //   for (k_ = k - 1; k_ >= 0; --k_)
-    // to avoid wraparound of an unsigned type.
-    do {
-        ulong t_ = t;
-        t = T.get(k_, n_);
-        double centroid = 0.0;
-        for (ulong i = t; i < t_; ++i) {
-            sorted_clusters[i] = k_;
-            // Mean computation: this is only for squared L2 cost calculators
-            centroid += (
-                (sorted_array[i] - centroid)
-                * cost_calculator.weight(i, i)
-                / cost_calculator.weight(t, i)
-            );
-        }
-        centroids[k_] = centroid;
-        k_ -= 1;
-        n_ = t - 1;
-    } while (t > 0);
+    hirschberg_solve(
+        cost_calculator, sorted_array, 0, n, k, 0, sorted_clusters, centroids
+    );
 
     // ***************************************************
     // * Order cluster assignments to match de-sorted
