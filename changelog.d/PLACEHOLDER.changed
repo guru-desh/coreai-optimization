@@ -1,0 +1,1 @@
+Add `CoreAIExportError` for configuration errors raised during CoreAI (MLIR) export, so they can be caught separately from generic `ValueError`s.
