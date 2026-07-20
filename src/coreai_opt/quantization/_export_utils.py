@@ -16,6 +16,7 @@ from collections import OrderedDict
 import torch
 from torch import nn
 
+from coreai_opt.common import CoreAIExportError
 from coreai_opt.config.spec import CompressionTargetTensor
 from coreai_opt.quantization.spec.fake_quantize import FakeQuantizeImplBase
 from coreai_opt.quantization.spec.granularity import (
@@ -326,17 +327,17 @@ def validate_fp4_export(
             to resolve per-axis block sizes against the actual weight shape.
 
     Raises:
-        ValueError: If the FP4 configuration is not supported for export.
+        CoreAIExportError: If the FP4 configuration is not supported for export.
     """
     if fake_quant_mod.quantization_target != CompressionTargetTensor.WEIGHT:
-        raise ValueError(
+        raise CoreAIExportError(
             "FP4 quantization is only supported for weights during MLIR export. "
             f"Got quantization_target={fake_quant_mod.quantization_target}."
         )
 
     granularity = fake_quant_mod._granularity
     if not isinstance(granularity, PerBlockGranularity):
-        raise ValueError(
+        raise CoreAIExportError(
             f"FP4 quantization requires PerBlockGranularity. Got {type(granularity).__name__}."
         )
 
@@ -346,7 +347,7 @@ def validate_fp4_export(
     resolved_block_size = granularity.get_block_size(quantized_data.shape)
     expected_block_size = (1,) * (quantized_data.ndim - 1) + (_FP4_EXPORT_BLOCK_SIZE,)
     if resolved_block_size != expected_block_size:
-        raise ValueError(
+        raise CoreAIExportError(
             f"FP4 export requires per-axis block sizes {expected_block_size} for a "
             f"{quantized_data.ndim}D weight (blocks of {_FP4_EXPORT_BLOCK_SIZE} along "
             f"the last axis, no blocking elsewhere). Got resolved block sizes "

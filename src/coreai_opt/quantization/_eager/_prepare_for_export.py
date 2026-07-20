@@ -22,6 +22,7 @@ from coreai_opt._utils.torch_utils import (
     is_float4_dtype as _is_float4_dtype,
     mmap_module_state_dict as _mmap_module_state_dict,
 )
+from coreai_opt.common import CoreAIExportError
 from coreai_opt.config.spec import CompressionTargetTensor
 from coreai_opt.quantization._export_utils import (
     canonicalize_qparam_shape as _canonicalize_qparam_shape,
@@ -201,7 +202,9 @@ def _process_activation_quantization(model: nn.Module):
             CompressionTargetTensor.ACTIVATION,
         ):
             if _is_float4_dtype(module.dtype):
-                raise ValueError("FP4 activation quantization is not supported for MLIR export.")
+                raise CoreAIExportError(
+                    "FP4 activation quantization is not supported for MLIR export."
+                )
             modules_to_replace.append((name, module))
 
     # Replace each FakeQuantizeImplBase module

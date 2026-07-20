@@ -28,7 +28,7 @@ from coreai_opt._utils.torch_utils import (
     is_float4_dtype as _is_float4_dtype,
     sanitize_module_name as _sanitize_module_name,
 )
-from coreai_opt.common import CoreMLExportError
+from coreai_opt.common import CoreAIExportError, CoreMLExportError
 from coreai_opt.config.spec import CompressionTargetTensor
 from coreai_opt.quantization._export_utils import (
     canonicalize_qparam_shape as _canonicalize_qparam_shape,
@@ -342,9 +342,13 @@ def _process_mlir_activation_quantization(
         model: The graph module being modified
         node: The fake quantization node to replace
         fake_quant_mod: The fake quantization module
+
+    Raises:
+        CoreAIExportError: If the activation dtype is FP4 (not supported for
+            MLIR export).
     """
     if _is_float4_dtype(fake_quant_mod.dtype):
-        raise ValueError("FP4 activation quantization is not supported for MLIR export.")
+        raise CoreAIExportError("FP4 activation quantization is not supported for MLIR export.")
 
     def _import_coreai_custom_ops():
         import coreai_torch._compression.custom_layers  # noqa: PLC0415, F401
@@ -684,6 +688,9 @@ def prepare_for_mlir_export(model: torch.fx.GraphModule) -> torch.fx.GraphModule
                 _process_mlir_weight_quantization(model, node, fake_quant_mod)
             else:
                 _process_mlir_activation_quantization(model, node, fake_quant_mod)
+        except CoreAIExportError:
+            # Surface unsupported-config errors directly; don't relabel as a node failure.
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to process fake quantization node {node.name}: {e}") from e
 
