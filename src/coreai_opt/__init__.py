@@ -10,9 +10,10 @@ For deployment via Core AI on Apple Silicon.
 
 from . import palettization, pruning, quantization
 from ._about import __version__
-from .common import CoreMLExportError, ExportBackend
+from .common import CoreAIExportError, CoreMLExportError, ExportBackend
 
 __all__ = [
+    "CoreAIExportError",
     "CoreMLExportError",
     "ExportBackend",
     "__version__",
