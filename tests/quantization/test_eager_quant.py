@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrize import is_parametrized
 from torch.overrides import _get_current_function_mode
 
-from coreai_opt import ExportBackend
+from coreai_opt import CoreAIExportError, ExportBackend
 from coreai_opt._utils.insertion.torch_function.modes import RegisterEagerOptimizationMode
 from coreai_opt._utils.insertion.torch_function.registered_optimizers_tracker import (
     FunctionRegisteredOptimizers,
@@ -3426,7 +3426,7 @@ class TestFP4MLIRExportValidation:
         quantizer = Quantizer(model, config)
         quantizer.prepare((input_data,))
 
-        with pytest.raises(ValueError, match=error_match):
+        with pytest.raises(CoreAIExportError, match=error_match):
             quantizer.finalize(backend=ExportBackend.CoreAI)
 
 

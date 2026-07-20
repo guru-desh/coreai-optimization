@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.export.dynamic_shapes import Dim
 from torch.ops import coreai
 
-from coreai_opt import ExportBackend
+from coreai_opt import CoreAIExportError, ExportBackend
 from coreai_opt._utils.metadata_utils import (
     STATE_DICT_METADATA_BUFFER_PREFIX as _COREML_BUFFER_PREFIX,
 )
@@ -1416,7 +1416,7 @@ class TestFP4MLIRExportValidation:
         quantizer = Quantizer(model, config)
         quantizer.prepare((input_data,))
 
-        with pytest.raises(RuntimeError, match=error_match):
+        with pytest.raises(CoreAIExportError, match=error_match):
             quantizer.finalize(backend=ExportBackend.CoreAI)
 
 
