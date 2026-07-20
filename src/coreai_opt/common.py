@@ -160,6 +160,10 @@ class ExportBackend(_StrEnum, metaclass=_DeprecatedMemberEnumMeta):
         """Deprecated. Use `ExportBackend.CoreAI` instead."""
 
 
+class CoreAIExportError(ValueError):
+    """Raised when a configuration is not supported for CoreAI (MLIR) export."""
+
+
 class CoreMLExportError(ValueError):
     """Raised when a model cannot be exported to the CoreML backend."""
 
