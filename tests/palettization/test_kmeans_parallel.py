@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch.nn.utils.parametrize import is_parametrized
 
+from coreai_opt.common import ExportBackend
 from coreai_opt.palettization import (
     KMeansPalettizer,
     KMeansPalettizerConfig,
@@ -266,3 +267,43 @@ class TestCrossLayerParallel:
                 seq_palettizer._model(simple_model_input),
                 par_palettizer._model(simple_model_input),
             )
+
+
+_ACCELERATOR = (
+    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else None
+)
+
+
+@pytest.mark.skipif(_ACCELERATOR is None, reason="needs an accelerator for the model")
+class TestParallelOnAccelerator:
+    """Worker processes cluster on the CPU, and their results must land on the model's device."""
+
+    def _prepare(self, num_workers):
+        spec = PalettizationSpec(
+            n_bits=3,
+            granularity=PerGroupedChannelGranularity(group_size=32, axis=0),
+            cluster_dim=1,
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Linear(64, 64, bias=False), torch.nn.Linear(64, 64, bias=False)
+        ).to(_ACCELERATOR)
+        palettizer = KMeansPalettizer(model, _make_config(spec))
+        example = (torch.randn(1, 64, device=_ACCELERATOR),)
+        return palettizer, palettizer.prepare(example, num_workers=num_workers)
+
+    def test_lookup_tables_come_back_on_the_weights_device(self):
+        _, prepared = self._prepare(num_workers=2)
+
+        fps = _collect_fake_palettize_modules(prepared)
+        assert len(fps) == 2
+        for fp in fps:
+            assert fp.centroids.device.type == _ACCELERATOR
+
+    def test_finalize_folds_the_palettized_weights(self):
+        palettizer, prepared = self._prepare(num_workers=2)
+
+        finalized = palettizer.finalize(prepared, backend=ExportBackend.Torch)
+
+        for layer in finalized:
+            assert layer.weight.device.type == _ACCELERATOR
+            assert layer.weight[:32].unique().numel() <= 2**3 * 32

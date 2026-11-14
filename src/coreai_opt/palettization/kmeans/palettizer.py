@@ -648,13 +648,15 @@ class KMeansPalettizer(_BasePalettizer, _EagerCompressionComponentBuilderMixin):
         ``ParametrizationList`` supports item assignment, so this swaps the
         module into the live model without touching the surrounding
         parametrization registration. In the parallel path ``results`` holds the
-        workers' returned copies; in-process they are the same live objects
-        (mutated in place), so the assignment is a harmless no-op there.
+        workers' returned copies, which clustered a CPU copy of the weight and so
+        come back on the CPU; they are moved to the weight's device here. In-process
+        they are the same live objects (mutated in place), so the assignment and the
+        move are harmless no-ops there.
         """
         for info, new_fp in zip(fp_info, results, strict=True):
             if new_fp.is_disabled():
                 logger.warning("Disabling palettization for weight '%s'", new_fp.tensor_fqn)
-            info.module.parametrizations[info.attr_name][info.idx] = new_fp
+            info.module.parametrizations[info.attr_name][info.idx] = new_fp.to(info.weight.device)
 
     @staticmethod
     @contextmanager
